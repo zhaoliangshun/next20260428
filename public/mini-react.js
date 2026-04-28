@@ -9,6 +9,7 @@
  *   5. Commit          —— 提交阶段，真正操作 DOM
  *   6. Hooks           —— useState / useReducer / useEffect / useRef / useMemo / useCallback / useContext
  *   7. Context         —— createContext / Provider / Consumer / useContext
+ *   8. memo            —— 跳过 props 未变化的函数组件渲染
  *
  * 与真实 React 的简化点（为了可读性）：
  *   - 调度器用 requestIdleCallback 代替 Scheduler 包
@@ -41,11 +42,14 @@
       props: {
         ...props,
         // 把所有子节点统一成对象形式（原始值包装为文本节点）
-        children: children.flat().map(child =>
-          typeof child === 'object' && child !== null
-            ? child
-            : createTextElement(child)
-        ),
+        children: children
+          .flat(Infinity)
+          .filter(child => child !== null && child !== undefined && typeof child !== 'boolean')
+          .map(child =>
+            typeof child === 'object'
+              ? child
+              : createTextElement(child)
+          ),
       },
     }
   }
@@ -87,10 +91,15 @@
   let wipRoot         = null   // 正在构建的根 Fiber（work-in-progress 树）
   let deletions       = []     // 需要删除的 Fiber 列表
   let pendingRerender = false  // setState 在首次 commit 前被调用时的标记
+  let isCommitting    = false  // commit 阶段内触发的更新延后到本次提交之后
 
   // Hooks 执行时的上下文（对应真实 React 的 ReactCurrentDispatcher）
   let wipFiber  = null  // 当前正在执行的函数组件 Fiber
   let hookIndex = 0     // 当前 hook 在 hooks 数组中的下标
+
+  const MEMO_TYPE = typeof Symbol === 'function' ? Symbol('mini.memo') : '__mini_memo__'
+  const requestIdle = window.requestIdleCallback ||
+    (callback => setTimeout(() => callback({ timeRemaining: () => 50 }), 1))
 
   // ─────────────────────────────────────────────────────────────
   // § 4  WORK LOOP（工作循环）
@@ -118,10 +127,10 @@
       commitRoot()
     }
 
-    requestIdleCallback(workLoop)
+    requestIdle(workLoop)
   }
 
-  requestIdleCallback(workLoop)
+  requestIdle(workLoop)
 
   // ─────────────────────────────────────────────────────────────
   // § 5  PERFORM UNIT OF WORK（处理单个 Fiber）
@@ -136,7 +145,7 @@
    *   3. 都没有就向上找父节点的兄弟节点（uncle）
    */
   function performUnitOfWork(fiber) {
-    if (typeof fiber.type === 'function') {
+    if (isFunctionComponent(fiber)) {
       updateFunctionComponent(fiber)
     } else {
       updateHostComponent(fiber)
@@ -158,8 +167,25 @@
     hookIndex = 0
     wipFiber.hooks = []
 
-    // 调用函数组件，拿到它返回的 Element
-    const children = [fiber.type(fiber.props)]
+    const isMemo = isMemoType(fiber.type)
+    const component = isMemo ? fiber.type.type : fiber.type
+    const hasQueuedState = fiber.alternate?.hooks?.some(hook => hook.queue?.length > 0)
+    const canReuseMemo = isMemo &&
+      fiber.alternate &&
+      !hasQueuedState &&
+      fiber.type.compare(fiber.alternate.props, fiber.props)
+
+    // 调用函数组件，拿到它返回的 Element。memo 命中时跳过函数调用，复用上次结果。
+    const child = canReuseMemo
+      ? fiber.alternate.memoizedElement
+      : component(fiber.props)
+
+    if (canReuseMemo) {
+      wipFiber.hooks = fiber.alternate.hooks || []
+    }
+    fiber.memoizedElement = child
+
+    const children = [child]
     reconcileChildren(fiber, children)
   }
 
@@ -192,29 +218,43 @@
    *   - 类型不同且有新元素 → PLACEMENT（创建新节点）
    *   - 类型不同且有旧节点 → DELETION（删除旧节点）
    *
-   * 真实 React 还有 key 优化（列表复用），这里简化为按位置对比。
+   * 支持 key：有 key 时按 key 复用，避免列表删除 / 插入时状态错位。
    */
   function reconcileChildren(wipFiber_, elements) {
-    let index       = 0
-    let oldFiber    = wipFiber_.alternate && wipFiber_.alternate.child
+    const oldFibers = []
+    const keyedOldFibers = new Map()
+    const usedOldFibers = new Set()
+    let oldFiber = wipFiber_.alternate && wipFiber_.alternate.child
     let prevSibling = null
 
-    while (index < elements.length || oldFiber != null) {
-      const element = elements[index]
-      let newFiber  = null
+    while (oldFiber) {
+      oldFibers.push(oldFiber)
+      const key = getFiberKey(oldFiber)
+      if (key !== null) keyedOldFibers.set(key, oldFiber)
+      oldFiber = oldFiber.sibling
+    }
 
-      const sameType = oldFiber && element && element.type === oldFiber.type
+    elements.forEach((element, index) => {
+      if (!element) return
+
+      const key = getElementKey(element)
+      const oldMatch = key !== null
+        ? keyedOldFibers.get(key)
+        : oldFibers.find(fiber => !usedOldFibers.has(fiber) && getFiberKey(fiber) === null)
+      const sameType = oldMatch && element.type === oldMatch.type
+      let newFiber
 
       if (sameType) {
         // UPDATE：沿用旧 DOM，更新 props
         newFiber = {
-          type:      oldFiber.type,
+          type:      oldMatch.type,
           props:     element.props,
-          dom:       oldFiber.dom,      // 复用真实 DOM
+          dom:       oldMatch.dom,      // 复用真实 DOM
           return:    wipFiber_,
-          alternate: oldFiber,          // 双缓冲指针
+          alternate: oldMatch,          // 双缓冲指针
           effectTag: 'UPDATE',
         }
+        usedOldFibers.add(oldMatch)
       }
 
       if (element && !sameType) {
@@ -229,23 +269,27 @@
         }
       }
 
-      if (oldFiber && !sameType) {
-        // DELETION：旧节点不再需要
-        oldFiber.effectTag = 'DELETION'
-        deletions.push(oldFiber)
+      if (oldMatch && !sameType) {
+        oldMatch.effectTag = 'DELETION'
+        deletions.push(oldMatch)
+        usedOldFibers.add(oldMatch)
       }
-
-      if (oldFiber) oldFiber = oldFiber.sibling
 
       if (index === 0) {
         wipFiber_.child = newFiber
-      } else if (element) {
+      } else if (prevSibling) {
         prevSibling.sibling = newFiber
       }
 
       prevSibling = newFiber
-      index++
-    }
+
+    })
+
+    oldFibers.forEach(fiber => {
+      if (usedOldFibers.has(fiber)) return
+      fiber.effectTag = 'DELETION'
+      deletions.push(fiber)
+    })
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -261,10 +305,13 @@
    *   3. 更新 currentRoot，清空 wipRoot
    */
   function commitRoot() {
+    const finishedRoot = wipRoot
+    isCommitting = true
     deletions.forEach(fiber => commitWork(fiber))
-    commitWork(wipRoot.child)
-    currentRoot = wipRoot
+    commitWork(finishedRoot.child)
+    currentRoot = finishedRoot
     wipRoot = null
+    isCommitting = false
 
     // setState was called during the initial render (before currentRoot existed).
     // Now that currentRoot is set we can schedule the deferred re-render.
@@ -308,20 +355,38 @@
 
   /** 递归找到第一个有 DOM 的后代并从父节点移除 */
   function commitDeletion(fiber, parentDom) {
-    if (fiber.dom) {
-      runEffectCleanups(fiber)
-      parentDom.removeChild(fiber.dom)
-    } else {
-      commitDeletion(fiber.child, parentDom)
+    runUnmountEffects(fiber)
+    removeDomNodes(fiber, parentDom)
+  }
+
+  /** 组件卸载时：递归运行所有 useEffect 清理函数并清空 ref */
+  function runUnmountEffects(fiber) {
+    if (!fiber) return
+    if (fiber.hooks) {
+      fiber.hooks.forEach(hook => {
+        if (hook._isEffect && hook.cleanup) hook.cleanup()
+      })
+    }
+    if (fiber.dom && fiber.props?.ref) setRef(fiber.props.ref, null)
+    let child = fiber.child
+    while (child) {
+      runUnmountEffects(child)
+      child = child.sibling
     }
   }
 
-  /** 组件卸载时：运行所有 useEffect 的清理函数 */
-  function runEffectCleanups(fiber) {
-    if (!fiber || !fiber.hooks) return
-    fiber.hooks.forEach(hook => {
-      if (hook._isEffect && hook.cleanup) hook.cleanup()
-    })
+  /** 删除函数组件 / fragment 时，可能需要移除多个真实 DOM 后代 */
+  function removeDomNodes(fiber, parentDom) {
+    if (!fiber) return
+    if (fiber.dom) {
+      if (fiber.dom.parentNode === parentDom) parentDom.removeChild(fiber.dom)
+      return
+    }
+    let child = fiber.child
+    while (child) {
+      removeDomNodes(child, parentDom)
+      child = child.sibling
+    }
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -329,33 +394,46 @@
   // ─────────────────────────────────────────────────────────────
 
   const isEvent = key => key.startsWith('on')
-  const isProp  = key => key !== 'children' && !isEvent(key)
+  const isProp  = key => key !== 'children' && key !== 'key' && key !== 'ref' && !isEvent(key)
   const isNew   = (prev, next) => key => prev[key] !== next[key]
   const isGone  = (_prev, next) => key => !(key in next)
+  const eventAliases = { doubleclick: 'dblclick' }
+  const getEventName = name => {
+    const eventName = name.slice(2).toLowerCase()
+    return eventAliases[eventName] || eventName
+  }
 
   /**
    * updateDom 比较新旧 props，最小化地更新真实 DOM。
    * 处理：普通属性、className、style 对象、事件监听器。
    */
   function updateDom(dom, prevProps, nextProps) {
+    if (prevProps.ref !== nextProps.ref) setRef(prevProps.ref, null)
+
     // 移除不再存在 / 已变化的事件监听
     Object.keys(prevProps).filter(isEvent)
       .filter(k => !(k in nextProps) || isNew(prevProps, nextProps)(k))
       .forEach(name => {
-        dom.removeEventListener(name.slice(2).toLowerCase(), prevProps[name])
+        dom.removeEventListener(getEventName(name), prevProps[name])
       })
 
     // 清除消失的属性
     Object.keys(prevProps).filter(isProp)
       .filter(isGone(prevProps, nextProps))
-      .forEach(name => { dom[name] = '' })
+      .forEach(name => {
+        if (name === 'style') {
+          updateStyle(dom, prevProps.style, null)
+        } else {
+          dom[name] = ''
+        }
+      })
 
     // 设置新 / 变化的属性
     Object.keys(nextProps).filter(isProp)
       .filter(isNew(prevProps, nextProps))
       .forEach(name => {
-        if (name === 'style' && typeof nextProps[name] === 'object') {
-          Object.assign(dom.style, nextProps[name])
+        if (name === 'style') {
+          updateStyle(dom, prevProps.style, nextProps.style)
         } else if (name === 'className') {
           dom.className = nextProps[name]
         } else {
@@ -367,8 +445,39 @@
     Object.keys(nextProps).filter(isEvent)
       .filter(isNew(prevProps, nextProps))
       .forEach(name => {
-        dom.addEventListener(name.slice(2).toLowerCase(), nextProps[name])
+        dom.addEventListener(getEventName(name), nextProps[name])
       })
+
+    if (prevProps.ref !== nextProps.ref) setRef(nextProps.ref, dom)
+  }
+
+  function updateStyle(dom, prevStyle, nextStyle) {
+    if (typeof prevStyle === 'string' && typeof nextStyle !== 'string') {
+      dom.style.cssText = ''
+    }
+
+    if (prevStyle && typeof prevStyle === 'object') {
+      Object.keys(prevStyle).forEach(name => {
+        if (!nextStyle || typeof nextStyle !== 'object' || !(name in nextStyle)) {
+          dom.style[name] = ''
+        }
+      })
+    }
+
+    if (typeof nextStyle === 'string') {
+      dom.style.cssText = nextStyle
+    } else if (nextStyle && typeof nextStyle === 'object') {
+      Object.assign(dom.style, nextStyle)
+    }
+  }
+
+  function setRef(ref, value) {
+    if (!ref) return
+    if (typeof ref === 'function') {
+      ref(value)
+    } else {
+      ref.current = value
+    }
   }
 
   /** 根据 Fiber 创建对应的真实 DOM 节点 */
@@ -399,16 +508,17 @@
    *     将 queue 中积累的 action 依次 reduce，得到最新 state
    *   - dispatch 调用后：action 推入 queue，触发重新渲染
    */
-  function useReducer(reducer, initialState) {
+  function useReducer(reducer, initialState, init) {
     const oldHook = wipFiber.alternate?.hooks?.[hookIndex]
+    const queue = oldHook ? oldHook.queue : []
 
     const hook = {
-      state: oldHook ? oldHook.state : initialState,
-      queue: [],
+      state: oldHook ? oldHook.state : init ? init(initialState) : initialState,
+      queue,
     }
 
     // 把上一轮积累的 actions 全部 reduce 到最新状态
-    const actions = oldHook ? oldHook.queue : []
+    const actions = queue.splice(0)
     actions.forEach(action => {
       hook.state = reducer(hook.state, action)
     })
@@ -431,7 +541,8 @@
   function useState(initialState) {
     return useReducer(
       (state, action) => typeof action === 'function' ? action(state) : action,
-      initialState
+      initialState,
+      resolveInitialState
     )
   }
 
@@ -446,8 +557,7 @@
   function useEffect(callback, deps) {
     const oldHook = wipFiber.alternate?.hooks?.[hookIndex]
 
-    const depsChanged = !oldHook || !deps ||
-      deps.some((dep, i) => dep !== oldHook.deps?.[i])
+    const depsChanged = haveDepsChanged(oldHook?.deps, deps)
 
     const hook = {
       _isEffect: true,
@@ -480,8 +590,7 @@
   function useMemo(factory, deps) {
     const oldHook = wipFiber.alternate?.hooks?.[hookIndex]
 
-    const depsChanged = !oldHook || !deps ||
-      deps.some((dep, i) => dep !== oldHook.deps?.[i])
+    const depsChanged = haveDepsChanged(oldHook?.deps, deps)
 
     const hook = {
       value: depsChanged ? factory() : oldHook.value,
@@ -588,7 +697,7 @@
 
   /** setState / dispatch 调用后，调度一次重新渲染 */
   function scheduleRerender() {
-    if (!currentRoot) {
+    if (!currentRoot || isCommitting) {
       // Called during the initial render before the first commit.
       // Mark the flag; commitRoot will call us again once currentRoot is ready.
       pendingRerender = true
@@ -601,6 +710,52 @@
     }
     deletions      = []
     nextUnitOfWork = wipRoot
+  }
+
+  function isMemoType(type) {
+    return type && typeof type === 'object' && type.$$typeof === MEMO_TYPE
+  }
+
+  function isFunctionComponent(fiber) {
+    return typeof fiber.type === 'function' || isMemoType(fiber.type)
+  }
+
+  function memo(component, compare) {
+    return {
+      $$typeof: MEMO_TYPE,
+      type: component,
+      compare: compare || shallowEqualProps,
+    }
+  }
+
+  function shallowEqualProps(prevProps, nextProps) {
+    const prevKeys = Object.keys(prevProps).filter(key => key !== 'children' || !isEmptyChildren(prevProps[key]))
+    const nextKeys = Object.keys(nextProps).filter(key => key !== 'children' || !isEmptyChildren(nextProps[key]))
+    if (prevKeys.length !== nextKeys.length) return false
+    return prevKeys.every(key => Object.prototype.hasOwnProperty.call(nextProps, key) &&
+      Object.is(prevProps[key], nextProps[key]))
+  }
+
+  function isEmptyChildren(value) {
+    return Array.isArray(value) && value.length === 0
+  }
+
+  function haveDepsChanged(prevDeps, nextDeps) {
+    if (!prevDeps || !nextDeps) return true
+    if (prevDeps.length !== nextDeps.length) return true
+    return nextDeps.some((dep, i) => !Object.is(dep, prevDeps[i]))
+  }
+
+  function resolveInitialState(initialState) {
+    return typeof initialState === 'function' ? initialState() : initialState
+  }
+
+  function getElementKey(element) {
+    return element?.props?.key ?? null
+  }
+
+  function getFiberKey(fiber) {
+    return fiber?.props?.key ?? null
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -617,6 +772,7 @@
     useCallback,
     useContext,
     createContext,
+    memo,
   }
 
   window.MiniReactDOM = {

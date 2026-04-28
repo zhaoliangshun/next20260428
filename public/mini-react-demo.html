@@ -159,6 +159,16 @@
       color: #6ee7f7;
       letter-spacing: 0.05em;
     }
+
+    .memo-panel {
+      background: #111827;
+      border: 1px solid #263244;
+      border-radius: 8px;
+      padding: 10px;
+      margin: 8px 0;
+      color: #cbd5e1;
+      font-size: 0.85rem;
+    }
   </style>
 </head>
 <body>
@@ -177,7 +187,7 @@
   const {
     createElement: h,  // 对应 JSX 编译后的 React.createElement
     useState, useReducer, useEffect, useRef, useMemo, useCallback,
-    useContext, createContext,
+    useContext, createContext, memo,
   } = window.MiniReact
   const { render } = window.MiniReactDOM
 
@@ -230,7 +240,7 @@
           style: { flex: 1, marginBottom: 0 },
           value: input,
           onInput: e => setInput(e.target.value),
-          onKeydown: e => e.key === 'Enter' && add(),
+          onKeyDown: e => e.key === 'Enter' && add(),
           placeholder: '回车 / 点击添加…',
         }),
         h('button', { onClick: add, style: { margin: 0 } }, '添加'),
@@ -427,7 +437,7 @@
         `组件已渲染 ${renderCount.current} 次（ref 记录，不触发重渲染）`),
       h('input', {
         type: 'text',
-        ref: inputRef,  // 注意：简版 mini-react 不支持 ref prop，这里用 useEffect 代替
+        ref: inputRef,
         value: text,
         onInput: e => setText(e.target.value),
         placeholder: '自动聚焦，输入内容…',
@@ -435,8 +445,8 @@
       h('div', { style: { marginTop: '6px' } },
         h('button', {
           onClick: () => {
-            const el = document.querySelector('#ref-input')
-            if (el) { el.value = ''; el.focus() }
+            setText('')
+            if (inputRef.current) inputRef.current.focus()
           }, className: 'ghost',
         }, '清空并聚焦'),
       ),
@@ -567,6 +577,38 @@
   }
 
   // ─────────────────────────────────────────────────────────────
+  // Demo 10：memo —— props 不变时跳过组件函数执行
+  // ─────────────────────────────────────────────────────────────
+  const MemoNumberView = memo(function MemoNumberView({ num }) {
+    const renderCount = useRef(0)
+    renderCount.current++
+
+    return h('div', { className: 'memo-panel' },
+      h('div', null, `memo 子组件渲染次数：${renderCount.current}`),
+      h('div', { style: { color: '#6ee7f7', fontSize: '1.1rem', marginTop: '4px' } },
+        `收到的 num：${num}`),
+    )
+  })
+
+  function MemoDemo() {
+    const [num, setNum] = useState(1)
+    const [other, setOther] = useState(0)
+
+    return h('div', null,
+      h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' } },
+        h('span', { style: { minWidth: '4em', color: '#6ee7f7', fontWeight: 700 } }, num),
+        h('button', { onClick: () => setNum(n => n + 1), style: { margin: 0 } }, '改变 num'),
+      ),
+      h(MemoNumberView, { num }),
+      h('button', {
+        onClick: () => setOther(o => o + 1),
+        className: 'ghost',
+        style: { fontSize: '0.8rem' },
+      }, `只更新父组件（${other}次）`),
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
   // 根组件：把所有 Demo 组合在一起
   // ─────────────────────────────────────────────────────────────
   function App() {
@@ -615,6 +657,11 @@
         title: 'Demo 9：条件渲染 / Tabs',
         desc:  '按条件显示不同内容',
         component: Tabs,
+      },
+      {
+        title: 'Demo 10：memo',
+        desc:  'props 未变化时跳过组件函数执行',
+        component: MemoDemo,
       },
     ]
 
