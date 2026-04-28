@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mini React Demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f0f13;
+      color: #e8e8f0;
+      padding: 24px;
+      line-height: 1.6;
+    }
+
+    h1 {
+      font-size: 2rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #6ee7f7, #a78bfa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 8px;
+    }
+
+    .subtitle {
+      color: #888;
+      margin-bottom: 32px;
+      font-size: 0.9rem;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      gap: 20px;
+    }
+
+    .card {
+      background: #1a1a24;
+      border: 1px solid #2a2a3a;
+      border-radius: 12px;
+      padding: 20px;
+    }
+
+    .card h2 {
+      font-size: 1rem;
+      color: #a78bfa;
+      margin-bottom: 4px;
+      font-weight: 600;
+    }
+
+    .card .desc {
+      font-size: 0.78rem;
+      color: #666;
+      margin-bottom: 16px;
+    }
+
+    /* ── 通用组件样式 ── */
+    button {
+      background: #6366f1;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 6px 14px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      margin: 3px;
+      transition: background 0.15s;
+    }
+    button:hover  { background: #4f52d4; }
+    button.danger { background: #ef4444; }
+    button.danger:hover { background: #dc2626; }
+    button.ghost  { background: transparent; border: 1px solid #444; color: #ccc; }
+    button.ghost:hover { border-color: #888; color: #fff; }
+
+    input[type="text"], input[type="number"] {
+      background: #111;
+      border: 1px solid #333;
+      border-radius: 6px;
+      color: #e8e8f0;
+      padding: 6px 10px;
+      font-size: 0.85rem;
+      outline: none;
+      width: 100%;
+      margin-bottom: 8px;
+    }
+    input:focus { border-color: #6366f1; }
+
+    .count-display {
+      font-size: 2.5rem;
+      font-weight: 700;
+      color: #6ee7f7;
+      text-align: center;
+      padding: 8px 0;
+    }
+
+    .todo-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 0;
+      border-bottom: 1px solid #222;
+    }
+    .todo-item:last-child { border-bottom: none; }
+    .todo-item.done span  { text-decoration: line-through; color: #555; }
+
+    .tag {
+      display: inline-block;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 4px;
+      padding: 2px 8px;
+      font-size: 0.75rem;
+      color: #94a3b8;
+      margin: 2px;
+    }
+
+    .log {
+      background: #111;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-family: monospace;
+      font-size: 0.8rem;
+      color: #6ee7f7;
+      max-height: 120px;
+      overflow-y: auto;
+      margin-top: 8px;
+    }
+    .log p { margin: 1px 0; }
+
+    .progress {
+      height: 8px;
+      background: #1e293b;
+      border-radius: 4px;
+      overflow: hidden;
+      margin: 8px 0;
+    }
+    .progress-bar {
+      height: 100%;
+      background: linear-gradient(90deg, #6366f1, #06b6d4);
+      transition: width 0.3s;
+      border-radius: 4px;
+    }
+
+    .ctx-box {
+      padding: 10px;
+      border-radius: 8px;
+      text-align: center;
+      font-size: 0.85rem;
+      transition: all 0.3s;
+    }
+
+    .timer-display {
+      font-size: 3rem;
+      font-weight: 700;
+      text-align: center;
+      font-family: monospace;
+      color: #6ee7f7;
+      letter-spacing: 0.05em;
+    }
+  </style>
+</head>
+<body>
+  <h1>Mini React</h1>
+  <p class="subtitle">~500 行代码实现 React 核心 · 架构与真实 React 保持一致</p>
+
+  <div id="root"></div>
+
+  <!-- 加载 Mini React -->
+  <script src="/mini-react.js"></script>
+
+  <script>
+  // ─────────────────────────────────────────────────────────────
+  // 工具：从 window 取 API（避免每次都写 window.MiniReact.xxx）
+  // ─────────────────────────────────────────────────────────────
+  const {
+    createElement: h,  // 对应 JSX 编译后的 React.createElement
+    useState, useReducer, useEffect, useRef, useMemo, useCallback,
+    useContext, createContext,
+  } = window.MiniReact
+  const { render } = window.MiniReactDOM
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 1：计数器 —— useState 基础用法
+  // ─────────────────────────────────────────────────────────────
+  function Counter() {
+    const [count, setCount] = useState(0)
+
+    return h('div', null,
+      h('div', { className: 'count-display' }, count),
+      h('div', { style: { textAlign: 'center' } },
+        h('button', { onClick: () => setCount(c => c - 1) }, '−'),
+        h('button', { onClick: () => setCount(0), className: 'ghost' }, '重置'),
+        h('button', { onClick: () => setCount(c => c + 1) }, '+'),
+      )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 2：Todo 列表 —— 列表渲染 + 条件渲染
+  // ─────────────────────────────────────────────────────────────
+  function TodoList() {
+    const [todos, setTodos] = useState([
+      { id: 1, text: '学习 Fiber 架构', done: true },
+      { id: 2, text: '实现 Hooks',      done: false },
+      { id: 3, text: '写单元测试',      done: false },
+    ])
+    const [input, setInput] = useState('')
+
+    const add = () => {
+      if (!input.trim()) return
+      setTodos(prev => [
+        ...prev,
+        { id: Date.now(), text: input.trim(), done: false }
+      ])
+      setInput('')
+    }
+
+    const toggle = id =>
+      setTodos(prev => prev.map(t => t.id === id ? { ...t, done: !t.done } : t))
+
+    const remove = id =>
+      setTodos(prev => prev.filter(t => t.id !== id))
+
+    return h('div', null,
+      h('div', { style: { display: 'flex', gap: '6px', marginBottom: '8px' } },
+        h('input', {
+          type: 'text',
+          style: { flex: 1, marginBottom: 0 },
+          value: input,
+          onInput: e => setInput(e.target.value),
+          onKeydown: e => e.key === 'Enter' && add(),
+          placeholder: '回车 / 点击添加…',
+        }),
+        h('button', { onClick: add, style: { margin: 0 } }, '添加'),
+      ),
+      todos.length === 0
+        ? h('p', { style: { color: '#555', fontSize: '0.85rem' } }, '暂无待办')
+        : todos.map(todo =>
+            h('div', { className: `todo-item${todo.done ? ' done' : ''}`, key: todo.id },
+              h('input', {
+                type: 'checkbox',
+                checked: todo.done,
+                onChange: () => toggle(todo.id),
+                style: { cursor: 'pointer' },
+              }),
+              h('span', { style: { flex: 1 } }, todo.text),
+              h('button', { onClick: () => remove(todo.id), className: 'danger',
+                            style: { padding: '2px 8px', fontSize: '0.75rem' } }, '×'),
+            )
+          ),
+      h('p', {
+        style: { fontSize: '0.75rem', color: '#555', marginTop: '8px' }
+      }, `共 ${todos.length} 项，已完成 ${todos.filter(t => t.done).length} 项`)
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 3：useEffect —— 计时器 + 清理函数
+  // ─────────────────────────────────────────────────────────────
+  function Timer() {
+    const [running, setRunning] = useState(false)
+    const [seconds, setSeconds] = useState(0)
+
+    // effect 依赖 running：running 变化时重新执行
+    // 返回清理函数 → 下次 effect 执行前 / 组件卸载时自动调用
+    useEffect(() => {
+      if (!running) return
+      const id = setInterval(() => setSeconds(s => s + 1), 1000)
+      return () => clearInterval(id)  // 清理：清除定时器
+    }, [running])
+
+    const fmt = s => {
+      const m = String(Math.floor(s / 60)).padStart(2, '0')
+      const sec = String(s % 60).padStart(2, '0')
+      return `${m}:${sec}`
+    }
+
+    return h('div', null,
+      h('div', { className: 'timer-display' }, fmt(seconds)),
+      h('div', { style: { textAlign: 'center', marginTop: '8px' } },
+        h('button', { onClick: () => setRunning(r => !r) },
+          running ? '暂停' : '开始'),
+        h('button', { onClick: () => { setRunning(false); setSeconds(0) }, className: 'ghost' },
+          '重置'),
+      )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 4：useReducer —— 复杂状态管理
+  // ─────────────────────────────────────────────────────────────
+  const cartReducer = (state, action) => {
+    switch (action.type) {
+      case 'ADD':
+        const exists = state.items.find(i => i.id === action.item.id)
+        return {
+          ...state,
+          items: exists
+            ? state.items.map(i => i.id === action.item.id ? { ...i, qty: i.qty + 1 } : i)
+            : [...state.items, { ...action.item, qty: 1 }]
+        }
+      case 'REMOVE':
+        return { ...state, items: state.items.filter(i => i.id !== action.id) }
+      case 'CLEAR':
+        return { items: [] }
+      default:
+        return state
+    }
+  }
+
+  const PRODUCTS = [
+    { id: 1, name: '键盘', price: 299 },
+    { id: 2, name: '鼠标', price: 149 },
+    { id: 3, name: '显示器', price: 1299 },
+  ]
+
+  function ShoppingCart() {
+    const [cart, dispatch] = useReducer(cartReducer, { items: [] })
+
+    const total = cart.items.reduce((sum, i) => sum + i.price * i.qty, 0)
+
+    return h('div', null,
+      h('div', { style: { marginBottom: '10px' } },
+        PRODUCTS.map(p =>
+          h('button', {
+            key: p.id,
+            onClick: () => dispatch({ type: 'ADD', item: p }),
+            className: 'ghost',
+            style: { marginBottom: '4px', display: 'block', width: '100%', textAlign: 'left' },
+          }, `＋ ${p.name} ¥${p.price}`)
+        )
+      ),
+      cart.items.length === 0
+        ? h('p', { style: { color: '#555', fontSize: '0.85rem' } }, '购物车为空')
+        : h('div', null,
+            cart.items.map(item =>
+              h('div', { key: item.id, className: 'todo-item' },
+                h('span', { style: { flex: 1 } }, `${item.name} × ${item.qty}`),
+                h('span', { style: { color: '#6ee7f7', marginRight: '8px' } },
+                  `¥${item.price * item.qty}`),
+                h('button', {
+                  onClick: () => dispatch({ type: 'REMOVE', id: item.id }),
+                  className: 'danger',
+                  style: { padding: '2px 8px', fontSize: '0.75rem' }
+                }, '×'),
+              )
+            ),
+            h('div', { style: { borderTop: '1px solid #333', paddingTop: '8px', marginTop: '4px',
+                                 display: 'flex', justifyContent: 'space-between' } },
+              h('strong', null, '合计'),
+              h('strong', { style: { color: '#6ee7f7' } }, `¥${total}`),
+            ),
+            h('button', {
+              onClick: () => dispatch({ type: 'CLEAR' }),
+              className: 'ghost',
+              style: { marginTop: '8px', width: '100%' },
+            }, '清空购物车'),
+          )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 5：useMemo + useCallback —— 性能优化
+  // ─────────────────────────────────────────────────────────────
+  function ExpensiveDemo() {
+    const [num, setNum]       = useState(10)
+    const [other, setOther]   = useState(0)
+    const [log, setLog]       = useState([])
+
+    // useMemo：只有 num 变化时才重新计算（纯计算，无副作用）
+    const fib = useMemo(() => {
+      const n = Math.min(num, 35)
+      const calc = x => x <= 1 ? x : calc(x - 1) + calc(x - 2)
+      return calc(n)
+    }, [num])
+
+    // 副作用（写日志）必须放在 useEffect 里，不能在 useMemo 内调用 setState
+    useEffect(() => {
+      setLog(prev => [`计算 fib(${Math.min(num, 35)}) = ${fib}`, ...prev.slice(0, 4)])
+    }, [fib])
+
+    // useCallback：只有当函数真正需要更新时才重新创建
+    const handleNum = useCallback(
+      e => setNum(Number(e.target.value)),
+      []  // 函数体不依赖任何 state，永远不重新创建
+    )
+
+    return h('div', null,
+      h('label', { style: { fontSize: '0.8rem', color: '#888' } },
+        `fib(N)，N = ${num}`),
+      h('input', {
+        type: 'number', value: num, min: 1, max: 35,
+        onInput: handleNum,
+      }),
+      h('div', { style: { fontSize: '1.2rem', color: '#6ee7f7', margin: '6px 0' } },
+        `结果：${fib}`),
+      h('button', {
+        onClick: () => setOther(o => o + 1), className: 'ghost',
+        style: { fontSize: '0.8rem' }
+      }, `触发无关渲染（${other}次）—— fib 不会重算`),
+      h('div', { className: 'log' },
+        log.map((l, i) => h('p', { key: i }, l))
+      )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 6：useRef —— 访问 DOM + 存储不触发渲染的值
+  // ─────────────────────────────────────────────────────────────
+  function RefDemo() {
+    const inputRef   = useRef(null)   // 指向真实 DOM
+    const renderCount = useRef(0)     // 渲染次数（不触发重渲染）
+    const [text, setText] = useState('')
+
+    // 每次渲染都更新 ref，但不触发额外渲染
+    renderCount.current++
+
+    useEffect(() => {
+      // 组件 mount 后自动聚焦
+      if (inputRef.current) inputRef.current.focus()
+    }, [])  // 空 deps = 只执行一次
+
+    return h('div', null,
+      h('p', { style: { fontSize: '0.8rem', color: '#888', marginBottom: '6px' } },
+        `组件已渲染 ${renderCount.current} 次（ref 记录，不触发重渲染）`),
+      h('input', {
+        type: 'text',
+        ref: inputRef,  // 注意：简版 mini-react 不支持 ref prop，这里用 useEffect 代替
+        value: text,
+        onInput: e => setText(e.target.value),
+        placeholder: '自动聚焦，输入内容…',
+      }),
+      h('div', { style: { marginTop: '6px' } },
+        h('button', {
+          onClick: () => {
+            const el = document.querySelector('#ref-input')
+            if (el) { el.value = ''; el.focus() }
+          }, className: 'ghost',
+        }, '清空并聚焦'),
+      ),
+      h('p', { style: { marginTop: '8px', color: '#6ee7f7' } },
+        text ? `你输入了：${text}` : '等待输入…')
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 7：Context —— 跨层级传值
+  // ─────────────────────────────────────────────────────────────
+  const ThemeContext = createContext('dark')
+
+  function ThemedButton({ label, onClick }) {
+    const theme = useContext(ThemeContext)
+    const isDark = theme === 'dark'
+    return h('button', {
+      onClick,
+      style: {
+        background: isDark ? '#1e1e2e' : '#f1f5f9',
+        color:      isDark ? '#e8e8f0' : '#1e293b',
+        border:     `1px solid ${isDark ? '#444' : '#cbd5e1'}`,
+        borderRadius: '6px',
+        padding: '6px 14px',
+        cursor: 'pointer',
+        margin: '3px',
+      }
+    }, label)
+  }
+
+  function DeepChild() {
+    const theme = useContext(ThemeContext)
+    return h('div', {
+      className: 'ctx-box',
+      style: {
+        background: theme === 'dark' ? '#0f172a' : '#f8fafc',
+        color:      theme === 'dark' ? '#94a3b8' : '#475569',
+        border:     `1px solid ${theme === 'dark' ? '#1e293b' : '#e2e8f0'}`,
+        marginTop: '10px',
+      }
+    }, `深层子组件读取到主题：${theme}`)
+  }
+
+  function ContextDemo() {
+    const [theme, setTheme] = useState('dark')
+    const toggle = () => setTheme(t => t === 'dark' ? 'light' : 'dark')
+
+    // Provider 包裹后，所有子孙组件都能读取 theme
+    return h(ThemeContext.Provider, { value: theme },
+      h('div', null,
+        h('p', { style: { fontSize: '0.8rem', color: '#888', marginBottom: '8px' } },
+          '通过 Context 传递主题，无需 prop drilling'),
+        h(ThemedButton, { label: `切换主题（当前：${theme}）`, onClick: toggle }),
+        h(DeepChild, null),
+      )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 8：组件组合 —— 进度条 + 子组件通信
+  // ─────────────────────────────────────────────────────────────
+  function ProgressBar({ value }) {
+    return h('div', { className: 'progress' },
+      h('div', { className: 'progress-bar', style: { width: `${value}%` } })
+    )
+  }
+
+  function ProgressDemo() {
+    const [value, setValue] = useState(60)
+    const [logs, setLogs]   = useState([`初始进度：60%`])
+
+    const set = v => {
+      const clamped = Math.max(0, Math.min(100, v))
+      setValue(clamped)
+      setLogs(prev => [`设置进度：${clamped}%`, ...prev.slice(0, 4)])
+    }
+
+    return h('div', null,
+      h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px' } },
+        h('span', { style: { color: '#6ee7f7', fontWeight: 'bold', minWidth: '3em' } },
+          `${value}%`),
+        h(ProgressBar, { value }),
+      ),
+      h('div', null,
+        h('button', { onClick: () => set(0),   className: 'ghost' }, '0%'),
+        h('button', { onClick: () => set(25),  className: 'ghost' }, '25%'),
+        h('button', { onClick: () => set(50),  className: 'ghost' }, '50%'),
+        h('button', { onClick: () => set(75),  className: 'ghost' }, '75%'),
+        h('button', { onClick: () => set(100)              }, '100%'),
+      ),
+      h('div', { className: 'log' },
+        logs.map((l, i) => h('p', { key: i }, l))
+      )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 9：条件渲染 + 标签切换（Tabs）
+  // ─────────────────────────────────────────────────────────────
+  const TABS = [
+    { id: 'fiber',   label: 'Fiber 架构',   content: 'Fiber 是 React 16 引入的新协调引擎。每个组件对应一个 Fiber 节点，形成链表树。工作循环逐个处理 Fiber，可以随时中断（时间切片），让浏览器有机会响应用户交互。' },
+    { id: 'hooks',   label: 'Hooks',        content: 'Hooks 让函数组件拥有状态和副作用。它们依赖调用顺序（禁止在条件语句中调用）。每个 Hook 对应 Fiber 的 hooks 数组中的一个元素，渲染时按顺序读写。' },
+    { id: 'reconcil', label: 'Reconciler',  content: 'Reconciler 是 Diff 算法的实现。对比旧 Fiber 树和新 Element 列表，标记 PLACEMENT / UPDATE / DELETION，最后在 Commit 阶段批量更新 DOM，减少重排重绘。' },
+  ]
+
+  function Tabs() {
+    const [active, setActive] = useState('fiber')
+    const tab = TABS.find(t => t.id === active)
+
+    return h('div', null,
+      h('div', { style: { display: 'flex', gap: '6px', marginBottom: '12px' } },
+        TABS.map(t =>
+          h('button', {
+            key: t.id,
+            onClick: () => setActive(t.id),
+            style: {
+              background: active === t.id ? '#6366f1' : 'transparent',
+              border: `1px solid ${active === t.id ? '#6366f1' : '#444'}`,
+              color: active === t.id ? '#fff' : '#aaa',
+              margin: 0,
+            }
+          }, t.label)
+        )
+      ),
+      h('p', { style: { fontSize: '0.85rem', color: '#b0b0c0', lineHeight: 1.7 } },
+        tab.content)
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // 根组件：把所有 Demo 组合在一起
+  // ─────────────────────────────────────────────────────────────
+  function App() {
+    const cards = [
+      {
+        title: 'Demo 1：useState',
+        desc:  '基础状态管理，函数式更新',
+        component: Counter,
+      },
+      {
+        title: 'Demo 2：列表 + 条件渲染',
+        desc:  'map 渲染列表，条件表达式',
+        component: TodoList,
+      },
+      {
+        title: 'Demo 3：useEffect + 清理',
+        desc:  '副作用、依赖数组、清理函数',
+        component: Timer,
+      },
+      {
+        title: 'Demo 4：useReducer',
+        desc:  '复杂状态机，dispatch / action',
+        component: ShoppingCart,
+      },
+      {
+        title: 'Demo 5：useMemo + useCallback',
+        desc:  '跳过昂贵计算，稳定函数引用',
+        component: ExpensiveDemo,
+      },
+      {
+        title: 'Demo 6：useRef',
+        desc:  '访问 DOM / 存储无副作用的值',
+        component: RefDemo,
+      },
+      {
+        title: 'Demo 7：Context',
+        desc:  'createContext / Provider / useContext',
+        component: ContextDemo,
+      },
+      {
+        title: 'Demo 8：组件组合',
+        desc:  '父子通信，props 传递',
+        component: ProgressDemo,
+      },
+      {
+        title: 'Demo 9：条件渲染 / Tabs',
+        desc:  '按条件显示不同内容',
+        component: Tabs,
+      },
+    ]
+
+    return h('div', { className: 'grid' },
+      cards.map(({ title, desc, component: C }) =>
+        h('div', { key: title, className: 'card' },
+          h('h2', null, title),
+          h('p', { className: 'desc' }, desc),
+          h(C, null),
+        )
+      )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // 启动！
+  // ─────────────────────────────────────────────────────────────
+  render(h(App, null), document.getElementById('root'))
+  </script>
+</body>
+</html>
