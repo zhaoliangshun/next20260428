@@ -493,7 +493,7 @@
         h('button', { onClick: () => set(25),  className: 'ghost' }, '25%'),
         h('button', { onClick: () => set(50),  className: 'ghost' }, '50%'),
         h('button', { onClick: () => set(75),  className: 'ghost' }, '75%'),
-        h('button', { onClick: () => set(100)              }, '100%'),
+        h('button', { onClick: () => set(100),  className: 'ghost'}, '100%'),
       ),
       h('div', { className: 'log' },
         logs.map((l, i) => h('p', { key: i }, l))

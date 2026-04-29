@@ -85,15 +85,18 @@
   let deletions       = []     // 本轮需要删除的 Fiber 列表
   let pendingRerender = false  // commit 前调用 setState 时的延迟标记
   let isCommitting    = false  // commit 阶段内触发的更新需延后
-  let passiveVersion  = 0      // 用于跳过过期的 passive effect flush
+  let workLoopScheduled    = false
+  let pendingPassiveRoots  = []     // 等待 flush passive effects 的 fiber 列表
+  let passiveFlushScheduled = false // 防止重复调度 setTimeout
 
   let wipFiber  = null  // 当前正在渲染的函数组件 Fiber（hooks 上下文）
   let hookIndex = 0     // 当前 hook 的下标（保证 hooks 按调用顺序一一对应）
 
   let idCounter = 0     // useId 单调计数器
 
-  const requestIdle = window.requestIdleCallback ||
-    (cb => setTimeout(() => cb({ timeRemaining: () => 50 }), 1))
+  const requestIdle = window.requestIdleCallback
+    ? cb => window.requestIdleCallback(cb, { timeout: 16 })
+    : cb => setTimeout(() => cb({ timeRemaining: () => 50 }), 1)
 
   // ─────────────────────────────────────────────────────────────
   // § 4  WORK LOOP（工作循环）
@@ -107,6 +110,7 @@
    * 这里用 requestIdleCallback 简化：剩余时间 < 1ms 则暂停。
    */
   function workLoop(deadline) {
+    workLoopScheduled = false
     let shouldYield = false
 
     while (nextUnitOfWork && !shouldYield) {
@@ -116,10 +120,10 @@
 
     if (!nextUnitOfWork && wipRoot) commitRoot()
 
-    requestIdle(workLoop)
+    if (nextUnitOfWork || wipRoot) scheduleWorkLoop()
   }
 
-  requestIdle(workLoop)
+  scheduleWorkLoop()
 
   // ─────────────────────────────────────────────────────────────
   // § 5  PERFORM UNIT OF WORK（处理单个 Fiber）
@@ -331,13 +335,18 @@
     // Layout effect 内触发的更新必须同步提交，避免浏览器先绘制中间状态。
     flushSyncWork()
 
-    // Passive pass：延后到浏览器完成绘制后（不阻塞 UI）
-    if (currentRoot === finishedRoot) {
-      const version = ++passiveVersion
+    // Passive pass：收集本次提交的 fiber 树，统一在一次 setTimeout 中 flush。
+    // 之所以用列表而非版本号守卫：flushSyncWork() 可能在同一个 commitRoot 调用栈内
+    // 再次触发 commitRoot（layout effect → setState），那个新 commit 的 fiber 树里
+    // 所有 useEffect.callback 均为 null（deps 未变），而本次 commit 里的 callback
+    // 有可能是 非null（首次 mount）—— 必须保留并执行，不能被版本号覆盖跳过。
+    pendingPassiveRoots.push(finishedRoot.child)
+    if (!passiveFlushScheduled) {
+      passiveFlushScheduled = true
       setTimeout(() => {
-        if (version === passiveVersion && currentRoot === finishedRoot) {
-          flushPassiveEffects(finishedRoot.child)
-        }
+        passiveFlushScheduled = false
+        const roots = pendingPassiveRoots.splice(0)
+        roots.forEach(root => flushPassiveEffects(root))
       }, 0)
     }
 
@@ -723,6 +732,7 @@
     }
     deletions      = []
     nextUnitOfWork = wipRoot
+    scheduleWorkLoop()
   }
 
   /**
@@ -756,6 +766,7 @@
     }
     deletions      = []
     nextUnitOfWork = wipRoot
+    scheduleWorkLoop()
   }
 
   function flushSyncWork() {
@@ -763,6 +774,12 @@
       nextUnitOfWork = performUnitOfWork(nextUnitOfWork)
     }
     if (wipRoot) commitRoot()
+  }
+
+  function scheduleWorkLoop() {
+    if (workLoopScheduled) return
+    workLoopScheduled = true
+    requestIdle(workLoop)
   }
 
   const isFunctionComponent = fiber => typeof fiber.type === 'function'
