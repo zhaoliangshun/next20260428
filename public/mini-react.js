@@ -85,6 +85,7 @@
   let deletions       = []     // 本轮需要删除的 Fiber 列表
   let pendingRerender = false  // commit 前调用 setState 时的延迟标记
   let isCommitting    = false  // commit 阶段内触发的更新需延后
+  let passiveVersion  = 0      // 用于跳过过期的 passive effect flush
 
   let wipFiber  = null  // 当前正在渲染的函数组件 Fiber（hooks 上下文）
   let hookIndex = 0     // 当前 hook 的下标（保证 hooks 按调用顺序一一对应）
@@ -135,10 +136,17 @@
 
     let next = fiber
     while (next) {
+      completeUnitOfWork(next)
       if (next.sibling) return next.sibling
       next = next.return
     }
     return null
+  }
+
+  function completeUnitOfWork(fiber) {
+    if (fiber._context) {
+      fiber._context._currentValue = fiber._previousContextValue
+    }
   }
 
   /**
@@ -168,7 +176,13 @@
     }
 
     const renderFn = isMemo ? component._type : component
-    const child    = renderFn(fiber.props)
+    if (renderFn._context) {
+      fiber._context = renderFn._context
+      fiber._previousContextValue = renderFn._context._currentValue
+      renderFn._context._currentValue = fiber.props.value
+    }
+
+    const child = renderFn(fiber.props)
     fiber.memoizedElement = child
     reconcileChildren(fiber, Array.isArray(child) ? child : [child])
   }
@@ -305,6 +319,7 @@
 
     deletions.forEach(fiber => commitWork(fiber))
     commitWork(finishedRoot.child)
+    normalizeHostChildren(finishedRoot)
 
     currentRoot  = finishedRoot
     wipRoot      = null
@@ -313,8 +328,18 @@
     // Layout pass：DOM 已更新，浏览器尚未绘制 → 适合测量 DOM 尺寸
     commitAllLayoutEffects(finishedRoot.child)
 
+    // Layout effect 内触发的更新必须同步提交，避免浏览器先绘制中间状态。
+    flushSyncWork()
+
     // Passive pass：延后到浏览器完成绘制后（不阻塞 UI）
-    setTimeout(() => flushPassiveEffects(finishedRoot.child), 0)
+    if (currentRoot === finishedRoot) {
+      const version = ++passiveVersion
+      setTimeout(() => {
+        if (version === passiveVersion && currentRoot === finishedRoot) {
+          flushPassiveEffects(finishedRoot.child)
+        }
+      }, 0)
+    }
 
     // setState 在首次 commit 前被调用（currentRoot 当时为 null）
     // 现在 currentRoot 已就绪，执行被推迟的重渲染
@@ -345,7 +370,38 @@
     }
 
     commitWork(fiber.child)
+    if (fiber.dom) normalizeHostChildren(fiber)
     commitWork(fiber.sibling)
+  }
+
+  /**
+   * keyed diff 复用了旧 DOM，但复用不等于 DOM 位置已经正确。
+   * mutation pass 结束后，按新 Fiber 顺序移动错位节点，尽量不触碰已就位 DOM。
+   */
+  function normalizeHostChildren(parentFiber) {
+    if (!parentFiber?.dom) return
+    const doms = []
+    collectDirectHostChildren(parentFiber.child, doms)
+    let cursor = parentFiber.dom.firstChild
+    doms.forEach(dom => {
+      if (dom.parentNode === parentFiber.dom && dom === cursor) {
+        cursor = cursor.nextSibling
+        return
+      }
+      parentFiber.dom.insertBefore(dom, cursor)
+    })
+  }
+
+  function collectDirectHostChildren(fiber, doms) {
+    let node = fiber
+    while (node) {
+      if (node.dom) {
+        doms.push(node.dom)
+      } else {
+        collectDirectHostChildren(node.child, doms)
+      }
+      node = node.sibling
+    }
   }
 
   /** Layout pass：useLayoutEffect 同步执行 */
@@ -622,23 +678,25 @@
    *
    * 简化说明：真实 React 把 context 值存在 Fiber 树上，
    * 支持多层 Provider 嵌套覆盖，并精确订阅最近的 Provider。
-   * 这里用单一变量存储，足以覆盖 99% 的使用场景。
+   * 这里用渲染期栈恢复 Provider 值，支持常见的嵌套 Provider / sibling 隔离。
    */
   function createContext(defaultValue) {
+    function Provider({ children }) {
+      return Array.isArray(children)
+        ? createElement(Fragment, null, ...children)
+        : children
+    }
+    Provider._context = null
+
     const ctx = {
       _currentValue: defaultValue,
-
-      Provider({ value, children }) {
-        ctx._currentValue = value
-        return Array.isArray(children)
-          ? createElement(Fragment, null, ...children)
-          : children
-      },
+      Provider,
 
       Consumer({ children }) {
         return children(ctx._currentValue)
       },
     }
+    Provider._context = ctx
     return ctx
   }
 
@@ -677,11 +735,7 @@
    */
   function flushSync(callback) {
     callback()
-    // 同步消费 callback 触发的所有状态更新
-    while (nextUnitOfWork) {
-      nextUnitOfWork = performUnitOfWork(nextUnitOfWork)
-    }
-    if (wipRoot) commitRoot()
+    flushSyncWork()
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -702,6 +756,13 @@
     }
     deletions      = []
     nextUnitOfWork = wipRoot
+  }
+
+  function flushSyncWork() {
+    while (nextUnitOfWork) {
+      nextUnitOfWork = performUnitOfWork(nextUnitOfWork)
+    }
+    if (wipRoot) commitRoot()
   }
 
   const isFunctionComponent = fiber => typeof fiber.type === 'function'
