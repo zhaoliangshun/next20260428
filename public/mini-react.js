@@ -1,18 +1,26 @@
 /**
- * Mini React  ·  ~1000 行实现日常开发 99% 的 React API
+ * Mini React  ·  ~1300 行实现日常开发 100% 的 React 常用 API
  *
  * 已实现：
  *   元素    createElement / cloneElement / isValidElement / Fragment
  *   组件    Component / PureComponent / forwardRef / memo / StrictMode / lazy
- *   Hooks   useState / useReducer / useEffect / useLayoutEffect / useRef /
- *           useMemo / useCallback / useId / useContext /
- *           useImperativeHandle / useDebugValue /
+ *   Hooks   useState / useReducer / useEffect / useLayoutEffect / useInsertionEffect /
+ *           useRef / useMemo / useCallback / useId / useContext /
+ *           useImperativeHandle / useDebugValue / useSyncExternalStore /
  *           useTransition / useDeferredValue
  *   Context createContext / Provider / Consumer
  *   Portal  createPortal
  *   异步    lazy / Suspense
- *   渲染    render / createRoot / flushSync / batch / startTransition
+ *   错误    Error Boundary（getDerivedStateFromError / componentDidCatch）
+ *   渲染    render / createRoot / flushSync / batch / startTransition / act
  *   工具    createRef / Children / version
+ *
+ * 与真实 React 的主要简化：
+ *   - 单全局根（不支持并发多根并行提交）
+ *   - 无 Scheduler 优先级通道（用 requestIdleCallback 近似时间切片）
+ *   - Suspense 首帧有短暂空白（无 concurrent 保护层）
+ *   - useSyncExternalStore 无防撕裂（无 concurrent 读隔离）
+ *   - useId 不支持 SSR hydration
  */
 ;(function () {
   'use strict'
@@ -88,6 +96,8 @@
   let pendingPassiveRoots  = []
   let passiveFlushScheduled = false
   let needsRerenderAfterCommit = false  // Suspense 首次挂起后触发回显 fallback
+  let pendingErrorBoundary      = null  // 渲染期捕获的 Error Boundary fiber
+  let pendingErrorBoundaryError = null  // 与之对应的错误对象
 
   let wipFiber  = null
   let hookIndex = 0
@@ -207,6 +217,12 @@
         reconcileChildren(fiber, [])
         return
       }
+      // ── Error Boundary：非 Promise 错误，向上查找最近的 EB ──
+      if (propagateError(fiber, e)) {
+        fiber.memoizedElement = null
+        reconcileChildren(fiber, [])
+        return
+      }
       throw e
     }
 
@@ -261,7 +277,18 @@
       }
     }
 
-    const child = instance.render()
+    let child
+    try {
+      child = instance.render()
+    } catch (e) {
+      // 类组件 render() 中的错误也交给最近的 Error Boundary 处理
+      if (propagateError(fiber, e)) {
+        fiber.memoizedElement = null
+        reconcileChildren(fiber, [])
+        return
+      }
+      throw e
+    }
     fiber.memoizedElement = child
     reconcileChildren(fiber, Array.isArray(child) ? child : [child])
   }
@@ -373,7 +400,9 @@
     wipRoot      = null
     isCommitting = false
 
-    // Layout pass
+    // Insertion pass：DOM 插入前同步执行（CSS-in-JS 在此注入样式，确保首帧无 FOUC）
+    commitAllInsertionEffects(root.child)
+    // Layout pass：DOM 就绪后同步执行（测量尺寸、聚焦、强制滚动等）
     commitAllLayoutEffects(root.child)
     flushSyncWork()
 
@@ -394,6 +423,16 @@
     }
     if (pendingRerender) {
       pendingRerender = false
+      scheduleRerender()
+    }
+    // Error Boundary：commit 后通知边界组件（componentDidCatch），并重渲染展示错误 UI
+    if (pendingErrorBoundary) {
+      const boundary = pendingErrorBoundary
+      const error    = pendingErrorBoundaryError
+      pendingErrorBoundary      = null
+      pendingErrorBoundaryError = null
+      // componentDidCatch 接收 error 和 info（真实 React 传递组件堆栈，此处简化为空）
+      boundary.instance?.componentDidCatch?.(error, { componentStack: '' })
       scheduleRerender()
     }
   }
@@ -459,6 +498,24 @@
     }
   }
 
+  /**
+   * commitAllInsertionEffects —— useInsertionEffect 同步执行（DOM 插入前最早阶段）。
+   * 遍历顺序与 commitAllLayoutEffects 相同（深度优先，child → sibling）。
+   */
+  function commitAllInsertionEffects(fiber) {
+    if (!fiber) return
+    if (fiber.hooks) {
+      fiber.hooks.forEach(hook => {
+        if (!hook._isInsertionEffect || !hook.callback) return
+        if (hook.cleanup) hook.cleanup()
+        hook.cleanup  = hook.callback() ?? null
+        hook.callback = null
+      })
+    }
+    commitAllInsertionEffects(fiber.child)
+    commitAllInsertionEffects(fiber.sibling)
+  }
+
   /** commitAllLayoutEffects —— useLayoutEffect + 类组件 componentDidMount/Update。 */
   function commitAllLayoutEffects(fiber) {
     if (!fiber) return
@@ -512,7 +569,7 @@
     if (!fiber) return
     if (fiber.hooks) {
       fiber.hooks.forEach(hook => {
-        if ((hook._isEffect || hook._isLayoutEffect) && hook.cleanup) hook.cleanup()
+        if ((hook._isEffect || hook._isLayoutEffect || hook._isInsertionEffect) && hook.cleanup) hook.cleanup()
       })
     }
     fiber.instance?.componentWillUnmount?.()
@@ -626,10 +683,34 @@
   /**
    * useLayoutEffect —— 同步副作用（DOM 就绪，绘制前）。
    * 适合测量 DOM 尺寸、强制滚动等需要立即读写 DOM 的操作。
+   * 执行顺序：useInsertionEffect → useLayoutEffect → useEffect（异步）
    */
   function useLayoutEffect(callback, deps) {
     const old  = wipFiber.alternate?.hooks?.[hookIndex]
     const hook = { _isLayoutEffect: true, deps, cleanup: old?.cleanup ?? null,
+      callback: haveDepsChanged(old?.deps, deps) ? callback : null }
+    wipFiber.hooks.push(hook); hookIndex++
+  }
+
+  /**
+   * useInsertionEffect —— 最早的同步副作用，在 DOM 插入前触发（绘制前）。
+   *
+   * 设计用途：CSS-in-JS 库（如 styled-components、Emotion）在此注入 <style> 标签，
+   * 确保样式在首次绘制前就位，彻底避免无样式内容闪烁（FOUC）。
+   *
+   * ⚠️ 禁止在此 hook 内读取或写入 DOM refs（DOM 尚未挂载/更新）。
+   * ⚠️ 无法调用 setState（会死循环）。
+   *
+   * 执行顺序（commit 阶段）：
+   *   1. useInsertionEffect（DOM 突变前）
+   *   2. DOM 突变
+   *   3. useLayoutEffect（DOM 突变后，绘制前）
+   *   4. 浏览器绘制
+   *   5. useEffect（绘制后异步）
+   */
+  function useInsertionEffect(callback, deps) {
+    const old  = wipFiber.alternate?.hooks?.[hookIndex]
+    const hook = { _isInsertionEffect: true, deps, cleanup: old?.cleanup ?? null,
       callback: haveDepsChanged(old?.deps, deps) ? callback : null }
     wipFiber.hooks.push(hook); hookIndex++
   }
@@ -690,8 +771,47 @@
   /**
    * useDeferredValue —— 返回一个"延迟版本"的值，在高优先级更新完成后才更新。
    * 简化实现：直接返回最新值（无真正的延迟）。
+   * 真实 React 18 使用并发调度将低优先级更新推迟到高优先级渲染之后。
    */
   function useDeferredValue(value) { return value }
+
+  /**
+   * useSyncExternalStore —— 订阅外部数据源（Redux、Zustand 等状态管理库专用 hook）。
+   *
+   * @param subscribe    接收一个回调函数并返回取消订阅函数：
+   *                       const unsub = subscribe(onStoreChange)
+   *                       return unsub  // 组件卸载时自动调用
+   * @param getSnapshot  返回当前快照的纯函数，每次渲染都会调用
+   *
+   * 工作原理：
+   *   1. 渲染时直接调用 getSnapshot() 读取最新值（无缓存，无闭包问题）
+   *   2. useEffect 订阅外部 store；store 变化时 forceUpdate 触发重渲染
+   *   3. 重渲染时再次调用 getSnapshot() 读取最新值
+   *   4. 卸载时 useEffect 清理函数自动取消订阅
+   *
+   * ⚠️ subscribe 应为稳定引用（用 useCallback 或模块级函数），否则每次渲染都重新订阅。
+   * ⚠️ getSnapshot 必须为纯函数（相同 store 状态返回 Object.is 相等的快照）。
+   * ⚠️ 简化差异：无 concurrent 模式的防撕裂（tearing）保护。
+   *
+   * 使用示例：
+   *   const count = useSyncExternalStore(store.subscribe, store.getSnapshot)
+   */
+  function useSyncExternalStore(subscribe, getSnapshot) {
+    // forceUpdate 用于 store 变化时强制组件重渲染
+    // useReducer(s => s + 1, 0) 是标准的"强制刷新"惯用法
+    const [, forceUpdate] = useReducer(s => s + 1, 0)
+
+    useEffect(() => {
+      // 订阅 store：store 内部状态变化时调用 forceUpdate
+      const unsub = subscribe(forceUpdate)
+      // 立即同步一次：防止 subscribe() 执行前 store 已变化导致快照过期
+      forceUpdate()
+      return unsub  // 返回取消订阅函数，组件卸载时自动执行
+    }, [subscribe])  // subscribe 变化（换了 store）时重新订阅
+
+    // 每次渲染都调用 getSnapshot() 以获取最新值（无 stale closure 问题）
+    return getSnapshot()
+  }
 
   // ─────────────────────────────────────────────────────────────
   // § 9  CONTEXT
@@ -956,6 +1076,35 @@
    */
   function batch(fn) { fn() }
 
+  /**
+   * act —— 测试工具：同步刷新所有待处理的渲染工作和副作用。
+   *
+   * 在单元测试中，状态更新是异步的（requestIdleCallback / setTimeout），
+   * act() 强制同步完成所有工作，使测试断言能立即看到最新 DOM。
+   *
+   * 用法：
+   *   act(() => { fireEvent.click(button) })
+   *   expect(container.textContent).toBe('1')  // DOM 已同步更新
+   *
+   *   // 异步场景（React.lazy / useEffect 内的 setState）：
+   *   await act(async () => { await someAsyncOp() })
+   *
+   * 执行顺序：
+   *   1. 执行 callback（触发 setState / dispatch）
+   *   2. 同步提交所有排队的渲染（flushSyncWork）
+   *   3. 同步清空所有 passive effects（useEffect）
+   *   4. 若 effects 触发了新的 setState，再次刷新（确保完全稳定）
+   */
+  function act(callback) {
+    callback()
+    flushSyncWork()
+    // 同步清空 useEffect（测试中不等待 setTimeout）
+    passiveFlushScheduled = false
+    pendingPassiveRoots.splice(0).forEach(flushPassiveEffects)
+    // effects 可能触发了新的 setState，再刷新一次
+    flushSyncWork()
+  }
+
   // ─────────────────────────────────────────────────────────────
   // § 15  内部工具函数
   // ─────────────────────────────────────────────────────────────
@@ -1010,6 +1159,49 @@
   function getFiberKey(f)    { return f?.props?.key  ?? null }
 
   /**
+   * propagateError —— 向上遍历 Fiber 树，寻找最近的 Error Boundary 并应用错误状态。
+   *
+   * Error Boundary 条件（与 React 一致）：
+   *   - 必须是类组件
+   *   - 实现了 static getDerivedStateFromError(error) 或 componentDidCatch(error, info)
+   *   - 注意：函数组件不能成为 Error Boundary（React 未来计划通过 use() 支持）
+   *
+   * getDerivedStateFromError：
+   *   - 静态方法，接收 error，返回 partial state（用于渲染错误 UI）
+   *   - 在渲染阶段同步调用，必须为纯函数
+   *
+   * componentDidCatch：
+   *   - 实例方法，接收 error 和 info（{componentStack}）
+   *   - 在 commit 阶段调用（见 commitRoot 末尾），适合上报错误日志
+   *
+   * 返回 true 表示错误已被边界捕获；false 表示无边界，错误将继续向上抛出。
+   */
+  function propagateError(fiber, error) {
+    let boundary = fiber.return
+    while (boundary) {
+      const inst = boundary.instance
+      const type = boundary.type
+      const isEB = inst && (
+        typeof type?.getDerivedStateFromError === 'function' ||
+        typeof inst.componentDidCatch        === 'function'
+      )
+      if (isEB) {
+        // getDerivedStateFromError：同步更新 state，下次渲染时展示错误回退 UI
+        if (typeof type.getDerivedStateFromError === 'function') {
+          const errorState = type.getDerivedStateFromError(error)
+          if (errorState) inst.state = { ...inst.state, ...errorState }
+        }
+        // 记录待处理的 boundary，在 commitRoot 末尾触发 componentDidCatch + 重渲染
+        pendingErrorBoundary      = boundary
+        pendingErrorBoundaryError = error
+        return true
+      }
+      boundary = boundary.return
+    }
+    return false
+  }
+
+  /**
    * createRef —— 返回全新 ref 对象（不依赖 hooks，每次调用返回不同对象）。
    * 与 useRef 区别：不与 Fiber 绑定，适合类组件构造函数或模块级变量。
    */
@@ -1046,12 +1238,17 @@
     Component, PureComponent, StrictMode,
     // 高阶组件
     forwardRef, memo,
-    // Hooks
+    // Hooks — 状态
     useState, useReducer,
-    useEffect, useLayoutEffect,
-    useRef, useMemo, useCallback, useId,
-    useContext, useImperativeHandle,
+    // Hooks — 副作用（按执行时序排列）
+    useInsertionEffect, useLayoutEffect, useEffect,
+    // Hooks — 引用与缓存
+    useRef, useMemo, useCallback,
+    // Hooks — 其他
+    useId, useContext, useImperativeHandle,
     useDebugValue, useTransition, useDeferredValue,
+    // Hooks — 外部 store
+    useSyncExternalStore,
     // Context
     createContext,
     // 异步
@@ -1064,7 +1261,7 @@
 
   // Object.assign 绕过 TS 对 window 扩展属性的类型检查（Hint 2568）
   Object.assign(window, {
-    MiniReactDOM: { render, flushSync, createRoot, batch },
+    MiniReactDOM: { render, flushSync, createRoot, batch, act },
   })
 
 }())

@@ -195,11 +195,15 @@
   const {
     createElement: h,
     Fragment,
-    useState, useReducer, useEffect, useLayoutEffect,
+    useState, useReducer, useEffect, useLayoutEffect, useInsertionEffect,
     useRef, useMemo, useCallback, useId,
     useContext, createContext, memo, createRef, Children,
+    forwardRef, useImperativeHandle, useTransition,
+    createPortal, lazy, Suspense,
+    useSyncExternalStore,
+    Component, PureComponent,
   } = window.MiniReact
-  const { render, flushSync } = window.MiniReactDOM
+  const { render, flushSync, act } = window.MiniReactDOM
 
   // ─────────────────────────────────────────────────────────────
   // Demo 1：useState —— 基础状态管理
@@ -668,6 +672,427 @@
   }
 
   // ─────────────────────────────────────────────────────────────
+  // Demo 14：forwardRef + useImperativeHandle —— 暴露子组件命令式 API
+  // ─────────────────────────────────────────────────────────────
+  // forwardRef 让父组件通过 ref 拿到子组件暴露的命令式接口
+  // useImperativeHandle 精确控制暴露的内容（不直接暴露 DOM 节点）
+  const FancyInput = forwardRef(function FancyInput({ label }, ref) {
+    const inputRef = useRef(null)
+    const [value, setValue] = useState('')
+
+    // 向父组件暴露 focus / reset / getValue 三个命令
+    useImperativeHandle(ref, () => ({
+      focus:    () => inputRef.current?.focus(),
+      reset:    () => setValue(''),
+      getValue: () => value,
+    }), [value])
+
+    return h('div', null,
+      h('label', null, label),
+      h('input', {
+        ref: inputRef,
+        type: 'text',
+        value,
+        onInput: e => setValue(e.target.value),
+        placeholder: '父组件可调用 focus / reset…',
+      })
+    )
+  })
+
+  function ForwardRefDemo() {
+    const inputRef = useRef(null)
+    const [msg, setMsg] = useState('')
+
+    return h('div', null,
+      h(FancyInput, { label: '受控输入框', ref: inputRef }),
+      h('div', { style: { marginTop: '8px' } },
+        h('button', {
+          onClick: () => inputRef.current?.focus()
+        }, '聚焦'),
+        h('button', {
+          className: 'ghost',
+          onClick: () => { inputRef.current?.reset(); setMsg('') }
+        }, '重置'),
+        h('button', {
+          className: 'ghost',
+          onClick: () => setMsg(`当前值：${inputRef.current?.getValue()}`)
+        }, '读取值'),
+      ),
+      msg && h('p', { style: { color: '#6ee7f7', marginTop: '6px', fontSize: '0.85rem' } }, msg)
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 15：createPortal —— 将内容渲染到 document.body
+  // ─────────────────────────────────────────────────────────────
+  // Portal 让模态框、Toast 等组件逃离父容器的 overflow/z-index 限制
+  function PortalDemo() {
+    const [open, setOpen] = useState(false)
+
+    const modal = open && createPortal(
+      h('div', {
+        onClick: () => setOpen(false),
+        style: {
+          position: 'fixed', inset: 0,
+          background: 'rgba(0,0,0,0.7)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          zIndex: 9999,
+        }
+      },
+        h('div', {
+          onClick: e => e.stopPropagation(),
+          style: {
+            background: '#1a1a24', border: '1px solid #6366f1',
+            borderRadius: '12px', padding: '24px', minWidth: '280px',
+            boxShadow: '0 20px 60px rgba(0,0,0,0.5)',
+          }
+        },
+          h('h3', { style: { color: '#a78bfa', marginBottom: '12px' } }, '这是一个 Portal 模态框'),
+          h('p', { style: { color: '#888', fontSize: '0.85rem', marginBottom: '16px' } },
+            '渲染到 document.body，不受父容器样式限制。点击遮罩或下方按钮关闭。'),
+          h('button', { onClick: () => setOpen(false) }, '关闭')
+        )
+      ),
+      document.body
+    )
+
+    return h('div', null,
+      h('p', { style: { fontSize: '0.8rem', color: '#888', marginBottom: '8px' } },
+        '模态框通过 Portal 渲染到 document.body，但事件冒泡仍沿 React 树传播'),
+      h('button', { onClick: () => setOpen(true) }, '打开模态框'),
+      modal,
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 16：Error Boundary —— 捕获子树渲染错误
+  // ─────────────────────────────────────────────────────────────
+  // Error Boundary 必须是类组件，函数组件不能成为边界
+  class ErrorBoundaryDemo extends Component {
+    constructor(props) {
+      super(props)
+      this.state = { hasError: false, error: null }
+    }
+
+    // 渲染阶段同步调用：返回 partial state 用于渲染错误 UI
+    static getDerivedStateFromError(error) {
+      return { hasError: true, error }
+    }
+
+    // commit 阶段调用：适合上报错误日志（Sentry 等）
+    componentDidCatch(error, info) {
+      console.error('[ErrorBoundary] caught:', error, info)
+    }
+
+    render() {
+      if (this.state.hasError) {
+        return h('div', {
+          style: {
+            background: '#2a1a1a', border: '1px solid #ef4444',
+            borderRadius: '8px', padding: '12px',
+          }
+        },
+          h('p', { style: { color: '#ef4444', fontWeight: 600 } }, '⚠ 组件崩溃'),
+          h('p', { style: { color: '#888', fontSize: '0.8rem', margin: '4px 0 10px' } },
+            this.state.error?.message),
+          h('button', {
+            onClick: () => this.setState({ hasError: false, error: null })
+          }, '重试')
+        )
+      }
+      return this.props.children
+    }
+  }
+
+  // 会随机崩溃的子组件——用于演示错误边界捕获
+  function BuggyChild({ shouldCrash }) {
+    if (shouldCrash) throw new Error('组件故意抛出的错误！')
+    return h('p', { style: { color: '#6ee7f7' } }, '子组件正常渲染 ✓')
+  }
+
+  function ErrorBoundaryWrapper() {
+    const [crash, setCrash] = useState(false)
+
+    return h('div', null,
+      h('p', { style: { fontSize: '0.8rem', color: '#888', marginBottom: '8px' } },
+        '点击"触发崩溃"让子组件抛出错误，ErrorBoundary 会捕获并展示回退 UI'),
+      h(ErrorBoundaryDemo, null,
+        h(BuggyChild, { shouldCrash: crash })
+      ),
+      h('div', { style: { marginTop: '10px' } },
+        h('button', {
+          className: 'danger',
+          onClick: () => setCrash(true)
+        }, '触发崩溃'),
+        h('button', {
+          className: 'ghost',
+          onClick: () => setCrash(false)
+        }, '恢复正常'),
+      )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 17：useTransition —— 低优先级过渡更新
+  // ─────────────────────────────────────────────────────────────
+  // isPending 在 startTransition 回调执行期间为 true
+  // 适合场景：搜索过滤、页面路由切换等耗时更新
+  function TransitionDemo() {
+    const [query, setQuery]   = useState('')
+    const [list, setList]     = useState([])
+    const [isPending, startTransition] = useTransition()
+
+    const ALL_ITEMS = Array.from({ length: 500 }, (_, i) => `Item ${i + 1}`)
+
+    const handleChange = e => {
+      const q = e.target.value
+      setQuery(q)
+      // 搜索列表过滤标记为低优先级过渡
+      startTransition(() => {
+        setList(q ? ALL_ITEMS.filter(s => s.toLowerCase().includes(q.toLowerCase())) : [])
+      })
+    }
+
+    return h('div', null,
+      h('input', {
+        type: 'text',
+        value: query,
+        onInput: handleChange,
+        placeholder: '输入搜索词（从 500 项中过滤）…',
+      }),
+      isPending
+        ? h('p', { style: { color: '#a78bfa', fontSize: '0.8rem' } }, '⏳ 更新中…')
+        : h('p', { style: { color: '#555', fontSize: '0.8rem' } },
+            query ? `找到 ${list.length} 项` : '请输入关键词'),
+      h('div', {
+        style: { maxHeight: '120px', overflowY: 'auto', marginTop: '6px' }
+      },
+        list.slice(0, 20).map(item =>
+          h('div', { key: item, style: { padding: '3px 0', fontSize: '0.82rem', color: '#94a3b8', borderBottom: '1px solid #1e293b' } }, item)
+        )
+      )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 18：useSyncExternalStore —— 订阅外部 store
+  // ─────────────────────────────────────────────────────────────
+  // 模拟一个最小 Flux/Redux-like store（可在组件树外部独立运行）
+  const counterStore = (() => {
+    let state     = { count: 0, step: 1 }
+    const listeners = new Set()
+
+    const notify = () => listeners.forEach(fn => fn())
+
+    return {
+      // getSnapshot：纯函数，返回当前状态（useSyncExternalStore 每次渲染都会调用）
+      getSnapshot: () => state,
+      // subscribe：接收回调，返回取消订阅函数
+      subscribe: cb => { listeners.add(cb); return () => listeners.delete(cb) },
+      increment: () => { state = { ...state, count: state.count + state.step }; notify() },
+      decrement: () => { state = { ...state, count: state.count - state.step }; notify() },
+      setStep:   s  => { state = { ...state, step: s }; notify() },
+      reset:     ()  => { state = { count: 0, step: state.step }; notify() },
+    }
+  })()
+
+  function ExternalStoreDemo() {
+    // useSyncExternalStore：store 在 React 树外部管理，组件直接订阅
+    const { count, step } = useSyncExternalStore(
+      counterStore.subscribe,
+      counterStore.getSnapshot,
+    )
+
+    return h('div', null,
+      h('div', { className: 'count-display' }, count),
+      h('p', { style: { textAlign: 'center', fontSize: '0.8rem', color: '#888', margin: '4px 0 10px' } },
+        `步进：${step}`),
+      h('div', { style: { textAlign: 'center' } },
+        h('button', { onClick: counterStore.decrement }, '−'),
+        h('button', { onClick: counterStore.reset, className: 'ghost' }, '重置'),
+        h('button', { onClick: counterStore.increment }, '+'),
+      ),
+      h('div', { style: { display: 'flex', gap: '6px', marginTop: '10px', alignItems: 'center' } },
+        h('span', { style: { fontSize: '0.8rem', color: '#888' } }, '步进：'),
+        h('button', { className: 'ghost', onClick: () => counterStore.setStep(1)  }, '1'),
+        h('button', { className: 'ghost', onClick: () => counterStore.setStep(5)  }, '5'),
+        h('button', { className: 'ghost', onClick: () => counterStore.setStep(10) }, '10'),
+      )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 19：Suspense + lazy —— 懒加载组件（模拟异步加载）
+  // ─────────────────────────────────────────────────────────────
+  // lazy() 接收一个返回 Promise<{default: Component}> 的 factory
+  // Suspense 在 Promise 未 resolve 前展示 fallback
+  const LazyChart = lazy(() => new Promise(resolve => {
+    // 模拟 2 秒网络请求（真实场景为 import('./Chart.js')）
+    setTimeout(() => {
+      resolve({
+        default: function Chart() {
+          const bars = [60, 85, 40, 90, 55, 75, 30]
+          return h('div', { style: { marginTop: '8px' } },
+            h('div', { style: { display: 'flex', alignItems: 'flex-end', gap: '6px', height: '80px' } },
+              bars.map((h_, i) =>
+                h('div', {
+                  key: i,
+                  style: {
+                    flex: 1, height: `${h_}%`,
+                    background: `hsl(${220 + i * 15}, 70%, 60%)`,
+                    borderRadius: '3px 3px 0 0',
+                    transition: 'height 0.3s',
+                  }
+                })
+              )
+            ),
+            h('p', { style: { color: '#6ee7f7', fontSize: '0.8rem', marginTop: '6px', textAlign: 'center' } },
+              '图表加载完成 ✓')
+          )
+        }
+      })
+    }, 2000)
+  }))
+
+  function SuspenseDemo() {
+    const [show, setShow] = useState(false)
+
+    return h('div', null,
+      h('p', { style: { fontSize: '0.8rem', color: '#888', marginBottom: '8px' } },
+        '点击加载后，Suspense 展示 fallback，2 秒后显示懒加载的图表组件'),
+      h('button', { onClick: () => setShow(true) }, show ? '已加载（刷新页面重试）' : '加载图表'),
+      show && h(Suspense, {
+        fallback: h('div', {
+          style: { padding: '20px', textAlign: 'center', color: '#a78bfa' }
+        }, '⏳ 图表加载中…')
+      }, h(LazyChart, null))
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 20：PureComponent + 类组件生命周期
+  // ─────────────────────────────────────────────────────────────
+  // PureComponent 自带浅比较 shouldComponentUpdate，props/state 未变时跳过渲染
+  class LifecycleChild extends PureComponent {
+    constructor(props) {
+      super(props)
+      this.state = { localCount: 0 }
+      this.renderCount = 0
+    }
+
+    componentDidMount() {
+      // 挂载后执行（等价于 useEffect(fn, [])）
+      this.setState({ localCount: 1 })
+    }
+
+    componentDidUpdate(prevProps, prevState) {
+      // 仅在 props.value 真正变化时记录（PureComponent 已做浅比较）
+      if (prevProps.value !== this.props.value) {
+        console.log(`[LifecycleChild] props.value: ${prevProps.value} → ${this.props.value}`)
+      }
+    }
+
+    componentWillUnmount() {
+      console.log('[LifecycleChild] unmounted')
+    }
+
+    render() {
+      this.renderCount++
+      return h('div', { className: 'memo-panel' },
+        h('div', null, `PureComponent 渲染次数：${this.renderCount}`),
+        h('div', { style: { color: '#6ee7f7', fontSize: '1.1rem', marginTop: '4px' } },
+          `props.value = ${this.props.value}`),
+        h('div', { style: { color: '#a78bfa', fontSize: '0.85rem', marginTop: '4px' } },
+          `state.localCount = ${this.state.localCount}`),
+      )
+    }
+  }
+
+  function ClassComponentDemo() {
+    const [value, setValue]   = useState(1)
+    const [unrelated, setU]   = useState(0)
+
+    return h('div', null,
+      h(LifecycleChild, { value }),
+      h('div', { style: { marginTop: '10px' } },
+        h('button', { onClick: () => setValue(v => v + 1) },
+          '改变 props.value'),
+        h('button', {
+          className: 'ghost',
+          onClick: () => setU(u => u + 1)
+        }, `仅更新父组件（${unrelated}次）`),
+      ),
+      h('p', { style: { fontSize: '0.75rem', color: '#555', marginTop: '8px' } },
+        'PureComponent 会跳过 props/state 均未变化的渲染'),
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 21：useInsertionEffect —— CSS-in-JS 样式注入
+  // ─────────────────────────────────────────────────────────────
+  // 模拟 styled-components / Emotion：在 DOM 插入前注入动态样式
+  // useInsertionEffect 是三类 effect 中执行最早的（甚至早于 useLayoutEffect）
+  function InsertionEffectDemo() {
+    const [color, setColor]  = useState('#6366f1')
+    const [size, setSize]    = useState(16)
+    const styleRef           = useRef(null)
+
+    // 模拟 CSS-in-JS：每次 color/size 变化时动态注入 <style>
+    useInsertionEffect(() => {
+      if (!styleRef.current) {
+        styleRef.current = document.createElement('style')
+        document.head.appendChild(styleRef.current)
+      }
+      // 直接写入 cssText（真实 CSS-in-JS 库会生成唯一类名）
+      styleRef.current.textContent = `
+        .dynamic-text {
+          color: ${color};
+          font-size: ${size}px;
+          font-weight: bold;
+          padding: 8px;
+          border-left: 3px solid ${color};
+          transition: all 0.2s;
+        }
+      `
+      return () => {
+        // cleanup：移除注入的样式（组件卸载时）
+        if (styleRef.current?.parentNode) {
+          styleRef.current.parentNode.removeChild(styleRef.current)
+          styleRef.current = null
+        }
+      }
+    }, [color, size])
+
+    const COLORS = ['#6366f1', '#06b6d4', '#10b981', '#f59e0b', '#ef4444']
+
+    return h('div', null,
+      h('p', { className: 'dynamic-text' }, 'useInsertionEffect 动态注入的样式'),
+      h('div', { style: { marginBottom: '8px' } },
+        COLORS.map(c =>
+          h('button', {
+            key: c,
+            onClick: () => setColor(c),
+            style: {
+              background: c, border: 'none',
+              width: '24px', height: '24px',
+              borderRadius: '50%', margin: '2px',
+              cursor: 'pointer',
+              outline: c === color ? '2px solid white' : 'none',
+              outlineOffset: '2px',
+            }
+          }, '')
+        )
+      ),
+      h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+        h('span', { style: { fontSize: '0.8rem', color: '#888' } }, '字号：'),
+        h('button', { className: 'ghost', onClick: () => setSize(s => Math.max(12, s - 2)) }, '−'),
+        h('span', { style: { color: '#6ee7f7', minWidth: '3em', textAlign: 'center' } }, `${size}px`),
+        h('button', { className: 'ghost', onClick: () => setSize(s => Math.min(28, s + 2)) }, '+'),
+      )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
   // 根组件：把所有 Demo 组合在一起
   // ─────────────────────────────────────────────────────────────
   function App() {
@@ -684,7 +1109,15 @@
       { title: 'Demo 10：memo',              desc: 'props 未变化时跳过组件函数执行',             component: MemoDemo         },
       { title: 'Demo 11：useLayoutEffect',   desc: 'DOM 更新后、浏览器绘制前同步执行',          component: LayoutEffectDemo },
       { title: 'Demo 12：useId',             desc: '生成稳定唯一 ID，用于 label/input 关联',    component: UseIdDemo        },
-      { title: 'Demo 13：flushSync',         desc: '同步提交更新，立即读取最新 DOM',            component: FlushSyncDemo    },
+      { title: 'Demo 13：flushSync',           desc: '同步提交更新，立即读取最新 DOM',                    component: FlushSyncDemo        },
+      { title: 'Demo 14：forwardRef + useImperativeHandle', desc: '向父组件暴露子组件命令式 API',          component: ForwardRefDemo       },
+      { title: 'Demo 15：createPortal',       desc: '将模态框渲染到 document.body',                       component: PortalDemo           },
+      { title: 'Demo 16：Error Boundary',     desc: 'getDerivedStateFromError + componentDidCatch',       component: ErrorBoundaryWrapper },
+      { title: 'Demo 17：useTransition',      desc: '低优先级过渡更新，isPending 指示器',                  component: TransitionDemo       },
+      { title: 'Demo 18：useSyncExternalStore', desc: '订阅 React 树外部的 store（类 Redux）',            component: ExternalStoreDemo    },
+      { title: 'Demo 19：Suspense + lazy',    desc: '懒加载组件，加载期间展示 fallback',                   component: SuspenseDemo         },
+      { title: 'Demo 20：PureComponent + 生命周期', desc: '浅比较优化 + componentDidMount/Update/Unmount', component: ClassComponentDemo   },
+      { title: 'Demo 21：useInsertionEffect', desc: 'CSS-in-JS 样式注入（最早副作用阶段）',               component: InsertionEffectDemo  },
     ]
 
     return h('div', { className: 'grid' },
