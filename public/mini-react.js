@@ -270,7 +270,7 @@
       }
 
       if (index === 0) wipFiber_.child = newFiber
-      else if (prevSibling) prevSibling.sibling = newFiber
+      else prevSibling.sibling = newFiber
       prevSibling = newFiber
     })
 
@@ -332,7 +332,8 @@
     if (!fiber) return
 
     let domParentFiber = fiber.return
-    while (!domParentFiber.dom) domParentFiber = domParentFiber.return
+    while (domParentFiber && !domParentFiber.dom) domParentFiber = domParentFiber.return
+    if (!domParentFiber) return
     const parentDom = domParentFiber.dom
 
     if (fiber.effectTag === 'PLACEMENT' && fiber.dom) {
@@ -398,13 +399,13 @@
 
   /** 删除函数组件 / fragment 时，递归移除所有真实 DOM 后代 */
   function removeDomNodes(fiber, parentDom) {
-    if (!fiber) return
+    if (!fiber) return // 基础情况：空节点
     if (fiber.dom) {
-      if (fiber.dom.parentNode === parentDom) parentDom.removeChild(fiber.dom)
+      if (fiber.dom.parentNode === parentDom) parentDom.removeChild(fiber.dom) // 从父节点移除DOM
       return
     }
     let child = fiber.child
-    while (child) { removeDomNodes(child, parentDom); child = child.sibling }
+    while (child) { removeDomNodes(child, parentDom); child = child.sibling } // 递归遍历子树
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -413,10 +414,12 @@
 
   const isEvent = k => k.startsWith('on')
   const isProp  = k => k !== 'children' && k !== 'key' && k !== 'ref' && !isEvent(k)
-  const isNew   = (prev, next) => k => prev[k] !== next[k]
-  const isGone  = (_, next) => k => !(k in next)
-  const eventAliases = { doubleclick: 'dblclick' }
-  const toEventName  = name => { const n = name.slice(2).toLowerCase(); return eventAliases[n] || n }
+  const isNew = (prev, next) => k => !Object.is(prev[k], next[k])
+  const isGone = (_, next) => k => !(k in next)
+  const toEventName = name => {
+    const n = name.slice(2)
+    return n === 'doubleclick' ? 'dblclick' : n.toLowerCase()
+  }
 
   /**
    * updateDom：比较新旧 props，最小化地更新真实 DOM。
@@ -432,7 +435,7 @@
 
     // 清除消失的属性
     Object.keys(prevProps).filter(isProp).filter(isGone(prevProps, nextProps))
-      .forEach(k => { if (k === 'style') updateStyle(dom, prevProps.style, null); else dom[k] = '' })
+      .forEach(k => { if (k === 'style') updateStyle(dom, prevProps.style, null); dom[k] = '' })
 
     // 设置新 / 变化的属性
     Object.keys(nextProps).filter(isProp).filter(isNew(prevProps, nextProps))
@@ -496,14 +499,13 @@
    */
   function useReducer(reducer, initialState, init) {
     const oldHook = wipFiber.alternate?.hooks?.[hookIndex]
-    const queue   = oldHook ? oldHook.queue : []
 
     const hook = {
       state: oldHook ? oldHook.state : (init ? init(initialState) : initialState),
-      queue,
+      queue:  oldHook ? oldHook.queue : [],
     }
 
-    queue.splice(0).forEach(action => {
+    hook.queue.splice(0).forEach(action => {
       hook.state = reducer(hook.state, action)
     })
 
