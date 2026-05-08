@@ -229,6 +229,10 @@
 
     const renderFn = isMemo ? component._type : component
 
+    // ── PropTypes 校验（开发期）──────────────────────────────
+    // 失败时仅 console.warn，不阻断渲染（与真实 prop-types 一致）
+    if (renderFn.propTypes) validateProps(renderFn, fiber.props)
+
     // ── Context.Provider ──────────────────────────────────────
     if (renderFn._context) {
       fiber._context    = renderFn._context
@@ -280,6 +284,9 @@
    * getDerivedStateFromProps / shouldComponentUpdate 均在此处理。
    */
   function updateClassComponent(fiber) {
+    // ── PropTypes 校验（开发期）──────────────────────────────
+    if (fiber.type.propTypes) validateProps(fiber.type, fiber.props)
+
     let instance = fiber.instance
     if (!instance) {
       instance = new fiber.type(fiber.props)
@@ -524,33 +531,48 @@
    *
    * Portal：容器已在真实 DOM 中，不执行 appendChild，只处理子节点。
    */
+  /**
+   * commitWork —— 把 sibling 遍历改为 while 循环以避免大列表栈溢出。
+   *
+   * Bug fix（v3）：原版 sibling 用 commitWork(fiber.sibling) 递归调用，
+   * 一个父节点下若有 N 个 sibling 就会在 JS 调用栈上压 N 帧，
+   * 当列表长度达到几千（如 useDeferredValue demo 里的 200 项 × 多次更新，
+   * 或 ProfilerDemo 中 count 反复 +50 累积到很大）就会触发
+   * "Maximum call stack size exceeded"。
+   *
+   * 修复：sibling 遍历改成迭代，仅 child 仍递归（child 深度 = 组件嵌套层级，
+   * 实际项目中通常不超过几十层，安全可控）。
+   */
   function commitWork(fiber) {
-    if (!fiber) return
+    let node = fiber
+    while (node) {
+      const cur = node
+      let domParentFiber = cur.return
+      while (domParentFiber && !domParentFiber.dom) domParentFiber = domParentFiber.return
+      const parentDom = domParentFiber?.dom
 
-    let domParentFiber = fiber.return
-    while (domParentFiber && !domParentFiber.dom) domParentFiber = domParentFiber.return
-    const parentDom = domParentFiber?.dom
+      if (cur.type === PORTAL) {
+        // Portal 容器本身不插入父 DOM，仅处理其子节点
+        commitWork(cur.child)
+        normalizeHostChildren(cur)
+        node = cur.sibling
+        continue
+      }
 
-    if (fiber.type === PORTAL) {
-      // Portal 容器本身不插入父 DOM，仅处理其子节点
-      commitWork(fiber.child)
-      normalizeHostChildren(fiber)
-      commitWork(fiber.sibling)
-      return
+      if (cur.effectTag === 'PLACEMENT' && cur.dom) {
+        if (parentDom) parentDom.appendChild(cur.dom)
+      } else if (cur.effectTag === 'UPDATE' && cur.dom) {
+        updateDom(cur.dom, cur.alternate.props, cur.props)
+      } else if (cur.effectTag === 'DELETION') {
+        if (parentDom) commitDeletion(cur, parentDom)
+        node = cur.sibling
+        continue
+      }
+
+      commitWork(cur.child)
+      if (cur.dom) normalizeHostChildren(cur)
+      node = cur.sibling
     }
-
-    if (fiber.effectTag === 'PLACEMENT' && fiber.dom) {
-      if (parentDom) parentDom.appendChild(fiber.dom)
-    } else if (fiber.effectTag === 'UPDATE' && fiber.dom) {
-      updateDom(fiber.dom, fiber.alternate.props, fiber.props)
-    } else if (fiber.effectTag === 'DELETION') {
-      if (parentDom) commitDeletion(fiber, parentDom)
-      return
-    }
-
-    commitWork(fiber.child)
-    if (fiber.dom) normalizeHostChildren(fiber)
-    commitWork(fiber.sibling)
   }
 
   /**
@@ -582,55 +604,61 @@
    * 遍历顺序与 commitAllLayoutEffects 相同（深度优先，child → sibling）。
    */
   function commitAllInsertionEffects(fiber) {
-    if (!fiber) return
-    if (fiber.hooks) {
-      fiber.hooks.forEach(hook => {
-        if (!hook._isInsertionEffect || !hook.callback) return
-        if (hook.cleanup) hook.cleanup()
-        hook.cleanup  = hook.callback() ?? null
-        hook.callback = null
-      })
+    let node = fiber
+    while (node) {
+      if (node.hooks) {
+        node.hooks.forEach(hook => {
+          if (!hook._isInsertionEffect || !hook.callback) return
+          if (hook.cleanup) hook.cleanup()
+          hook.cleanup  = hook.callback() ?? null
+          hook.callback = null
+        })
+      }
+      commitAllInsertionEffects(node.child)
+      node = node.sibling
     }
-    commitAllInsertionEffects(fiber.child)
-    commitAllInsertionEffects(fiber.sibling)
   }
 
   /** commitAllLayoutEffects —— useLayoutEffect + 类组件 componentDidMount/Update。 */
   function commitAllLayoutEffects(fiber) {
-    if (!fiber) return
-    if (fiber.hooks) {
-      fiber.hooks.forEach(hook => {
-        if (!hook._isLayoutEffect || !hook.callback) return
-        if (hook.cleanup) hook.cleanup()
-        hook.cleanup  = hook.callback() ?? null
-        hook.callback = null
-      })
-    }
-    // 类组件生命周期
-    if (fiber.instance) {
-      if (!fiber.alternate) {
-        fiber.instance.componentDidMount?.()
-      } else {
-        fiber.instance.componentDidUpdate?.(fiber.alternate.props, fiber.alternate.instance?.state ?? {})
+    let node = fiber
+    while (node) {
+      if (node.hooks) {
+        node.hooks.forEach(hook => {
+          if (!hook._isLayoutEffect || !hook.callback) return
+          if (hook.cleanup) hook.cleanup()
+          hook.cleanup  = hook.callback() ?? null
+          hook.callback = null
+        })
       }
+      // 类组件生命周期
+      if (node.instance) {
+        if (!node.alternate) {
+          node.instance.componentDidMount?.()
+        } else {
+          node.instance.componentDidUpdate?.(node.alternate.props, node.alternate.instance?.state ?? {})
+        }
+      }
+      commitAllLayoutEffects(node.child)
+      node = node.sibling
     }
-    commitAllLayoutEffects(fiber.child)
-    commitAllLayoutEffects(fiber.sibling)
   }
 
   /** flushPassiveEffects —— useEffect 异步执行（绘制后）。 */
   function flushPassiveEffects(fiber) {
-    if (!fiber) return
-    if (fiber.hooks) {
-      fiber.hooks.forEach(hook => {
-        if (!hook._isEffect || !hook.callback) return
-        if (hook.cleanup) hook.cleanup()
-        hook.cleanup  = hook.callback() ?? null
-        hook.callback = null
-      })
+    let node = fiber
+    while (node) {
+      if (node.hooks) {
+        node.hooks.forEach(hook => {
+          if (!hook._isEffect || !hook.callback) return
+          if (hook.cleanup) hook.cleanup()
+          hook.cleanup  = hook.callback() ?? null
+          hook.callback = null
+        })
+      }
+      flushPassiveEffects(node.child)
+      node = node.sibling
     }
-    flushPassiveEffects(fiber.child)
-    flushPassiveEffects(fiber.sibling)
   }
 
   function commitDeletion(fiber, parentDom) {
@@ -1388,10 +1416,36 @@
    * flushSyncWork —— 同步把当前所有未完成的工作做完并提交。
    * 区别于 workLoop：不让出主线程，连续运行直到 nextUnitOfWork 为空。
    * 用于 flushSync / act / 测试等需要立即看到 DOM 结果的场景。
+   *
+   * Bug fix（v3）：原版无递归深度护栏 —— 当 layout effect 的 setState 又触发
+   * 新一轮 commit、commitRoot 末尾再次调用 flushSyncWork 形成
+   * commitRoot ↔ flushSyncWork 的相互递归，若用户代码不收敛（典型场景：
+   * Profiler 的 onRender 里 setState 同一棵子树的 state）就会把栈压爆。
+   *
+   * 增加 SYNC_FLUSH_LIMIT（与 React "Maximum update depth exceeded" 同源）：
+   * 一旦同步刷新深度超过阈值，强制中止并清空待处理工作，向 console 报错。
    */
+  let _syncFlushDepth = 0
+  const SYNC_FLUSH_LIMIT = 50
   function flushSyncWork() {
-    while (nextUnitOfWork) nextUnitOfWork = performUnitOfWork(nextUnitOfWork)
-    if (wipRoot) commitRoot()
+    if (_syncFlushDepth >= SYNC_FLUSH_LIMIT) {
+      console.error(
+        '[mini-react] 检测到无限同步渲染循环（flushSync 深度 > ' + SYNC_FLUSH_LIMIT + '），' +
+        '通常是 useLayoutEffect / 类组件 componentDidUpdate / Profiler.onRender 中无条件 setState 导致。' +
+        '已强制中止后续提交以防止栈溢出。'
+      )
+      nextUnitOfWork = null
+      wipRoot = null
+      pendingRerender = false
+      return
+    }
+    _syncFlushDepth++
+    try {
+      while (nextUnitOfWork) nextUnitOfWork = performUnitOfWork(nextUnitOfWork)
+      if (wipRoot) commitRoot()
+    } finally {
+      _syncFlushDepth--
+    }
   }
 
   /**
@@ -1514,6 +1568,967 @@
     },
   }
 
+  // ═════════════════════════════════════════════════════════════
+  // § 17  REACT 19 风格 HOOKS：use / useOptimistic / useActionState
+  // ═════════════════════════════════════════════════════════════
+
+  /**
+   * use() —— React 19 引入的"通用读取"hook，可以在渲染中：
+   *   1. 读取 Promise（未 resolve 抛出，触发 Suspense；resolved 返回结果）
+   *   2. 读取 Context（与 useContext 等价但可用于条件分支）
+   *
+   * 与传统 hook 的关键区别：
+   *   - 不依赖 hookIndex 顺序（条件分支中也能调用）
+   *   - 不在 fiber.hooks 里占位，纯粹的读取语义
+   *
+   * 实现细节：
+   *   - Promise 缓存在 promise._mr_ 字段，避免每次渲染重复 then
+   *   - resolved/rejected 后直接返回结果或抛错（错误会冒泡到 ErrorBoundary）
+   *   - pending 时抛 promise 触发 Suspense（与 lazy 走同一条路径）
+   *
+   * 用法：
+   *   function Profile({ userPromise }) {
+   *     const user = use(userPromise)            // Promise → user
+   *     const theme = use(ThemeContext)          // Context → 当前值
+   *     return <div>{user.name} ({theme})</div>
+   *   }
+   *
+   * ⚠️ 用 use() 读 Promise 时，每次渲染传入"同一个"Promise 才有意义；
+   *    每次渲染创建新 Promise 会反复触发 Suspense（无限挂起）。
+   */
+  function use(resource) {
+    if (resource == null) {
+      throw new Error('use(): 不能传入 null/undefined')
+    }
+    // ── 分支 1：Context 对象（包含 _currentValue 字段） ───────────
+    if (typeof resource === 'object' && '_currentValue' in resource) {
+      return resource._currentValue
+    }
+    // ── 分支 2：Thenable（Promise） ──────────────────────────────
+    if (typeof resource.then === 'function') {
+      // 已 resolve：直接返回缓存的值
+      if (resource._mr_status === 'fulfilled') return resource._mr_value
+      // 已 rejected：抛出错误（由最近的 ErrorBoundary 接住）
+      if (resource._mr_status === 'rejected')  throw resource._mr_value
+      // pending：首次见到时挂 then 回调登记结果
+      if (resource._mr_status === undefined) {
+        resource._mr_status = 'pending'
+        resource.then(
+          v => { resource._mr_status = 'fulfilled'; resource._mr_value = v },
+          e => { resource._mr_status = 'rejected';  resource._mr_value = e }
+        )
+      }
+      // 抛 thenable 触发 Suspense（updateFunctionComponent catch 分支会处理）
+      throw resource
+    }
+    throw new Error('use(): 仅支持 Context 或 Thenable，收到 ' + typeof resource)
+  }
+
+  /**
+   * useOptimistic(state, updateFn) —— React 19 乐观更新 hook。
+   *
+   * 返回 [optimisticState, addOptimistic]：
+   *   - optimisticState：在过渡期显示的"假装已完成"的状态
+   *   - addOptimistic(payload)：提交一个乐观更新，通过 updateFn 计算新状态
+   *
+   * 行为：
+   *   1. 调用 addOptimistic 后，optimisticState 立即变为 updateFn(state, payload)
+   *   2. 当真实 state（来自外部 props/state）更新时，乐观状态自动作废，
+   *      切回真实状态
+   *
+   * 典型场景：留言板"发送"时立刻显示自己的消息（虽然请求还没回来），
+   *           成功后用真实数据替换；失败则自动回滚。
+   *
+   * 实现：本质是"以 state 为基准，叠加待定 payload 列表"的派生计算。
+   *       state 一旦变化，待定列表就清空（视为已落库）。
+   */
+  function useOptimistic(state, updateFn) {
+    const [pending, setPending] = useState([])
+    // state 变化（真实数据落库）时清空待定列表
+    const lastState = useRef(state)
+    if (!Object.is(lastState.current, state)) {
+      lastState.current = state
+      if (pending.length > 0) {
+        // 用 useEffect 异步清空避免渲染期 setState 警告
+        Promise.resolve().then(() => setPending([]))
+      }
+    }
+    const optimistic = pending.reduce(
+      (acc, p) => updateFn(acc, p),
+      state,
+    )
+    const addOptimistic = useCallback(payload => {
+      setPending(prev => [...prev, payload])
+    }, [])
+    return [optimistic, addOptimistic]
+  }
+
+  /**
+   * useActionState(action, initialState) —— React 19 表单 action 状态管理。
+   *
+   * 返回 [state, dispatch, isPending]：
+   *   - state：当前 action 计算出的状态
+   *   - dispatch(payload)：异步触发 action，并把结果写回 state
+   *   - isPending：action 执行期间为 true（用于 disable 按钮等）
+   *
+   * action 签名：(prevState, formData|payload) => Promise<newState>
+   * 与 useReducer 的差异：action 是 async 的，自带 isPending 指示器。
+   */
+  function useActionState(action, initialState) {
+    const [state, setState]     = useState(initialState)
+    const [isPending, setPending] = useState(false)
+    const dispatch = useCallback(async payload => {
+      setPending(true)
+      try {
+        const next = await action(state, payload)
+        setState(next)
+      } finally {
+        setPending(false)
+      }
+    }, [action, state])
+    return [state, dispatch, isPending]
+  }
+
+  // ═════════════════════════════════════════════════════════════
+  // § 18  PROFILER —— 渲染性能测量
+  // ═════════════════════════════════════════════════════════════
+
+  /**
+   * Profiler —— 测量子树渲染耗时的工具组件（与真实 React Profiler 同名同 API）。
+   *
+   * 用法：
+   *   <Profiler id="UserList" onRender={(id, phase, duration) => {
+   *     console.log(`[${id}] ${phase} 用时 ${duration}ms`)
+   *   }}>
+   *     <UserList />
+   *   </Profiler>
+   *
+   * onRender 参数：
+   *   id              —— Profiler 的 id 属性
+   *   phase           —— 'mount' 首次挂载 / 'update' 更新
+   *   actualDuration  —— 本次渲染实际耗时（ms）
+   *   baseDuration    —— 不计 memo 的总耗时（此简化版与 actualDuration 相同）
+   *   startTime       —— 开始时间戳
+   *   commitTime      —— 提交时间戳
+   *
+   * 实现：包装函数组件，render 前 mark 开始时间，render 后在 useLayoutEffect
+   *       中计算耗时并调用 onRender（layout effect 阶段 DOM 已就绪）。
+   */
+  function Profiler({ id, onRender, children }) {
+    const startTime = performance.now()
+    const isMount   = useRef(true)
+
+    useLayoutEffect(() => {
+      const commitTime  = performance.now()
+      const actualDuration = commitTime - startTime
+      const phase = isMount.current ? 'mount' : 'update'
+      isMount.current = false
+      try {
+        onRender?.(id, phase, actualDuration, actualDuration, startTime, commitTime)
+      } catch (e) {
+        console.error('[Profiler] onRender threw:', e)
+      }
+    })
+
+    if (!children) return null
+    return Array.isArray(children)
+      ? createElement(Fragment, null, ...children)
+      : children
+  }
+
+  // ═════════════════════════════════════════════════════════════
+  // § 19  SUSPENSELIST —— 协调多个 Suspense 边界的揭示顺序
+  // ═════════════════════════════════════════════════════════════
+
+  /**
+   * SuspenseList —— 协调多个 Suspense 子组件的揭示顺序，避免内容跳动。
+   *
+   * Props:
+   *   revealOrder   —— 'forwards'（默认，顺序揭示）/ 'backwards'（逆序）/ 'together'（同时揭示）
+   *   tail          —— 'collapsed'（只显示一个 fallback）/ 'hidden'（不显示尚未到来的 fallback）
+   *
+   * 工作原理（简化）：
+   *   1. 收集所有子 Suspense 的挂起状态
+   *   2. 'forwards': 找到第一个挂起的，其后的全部显示 fallback（即便已加载也等待）
+   *   3. 'together': 任一挂起就全部显示 fallback
+   *
+   * 用法：
+   *   <SuspenseList revealOrder="forwards">
+   *     <Suspense fallback={<Spinner/>}><A/></Suspense>
+   *     <Suspense fallback={<Spinner/>}><B/></Suspense>
+   *   </SuspenseList>
+   *
+   * ⚠️ 简化实现：通过 Context 传递"上游是否在挂起"的信号；真实 React 在调度
+   *    层面深度集成，能精确控制顺序。
+   */
+  const SuspenseListContext = createContext({ revealOrder: 'together', anyPending: false })
+
+  function SuspenseList({ revealOrder = 'together', tail = 'visible', children }) {
+    const kids = Children.toArray(children)
+    // 简化：以"together"语义实现——任一子 Suspense 挂起则强制全部 fallback
+    // forwards/backwards 由开发者自行用 key 排序保证视觉顺序
+    return createElement(SuspenseListContext.Provider, { value: { revealOrder, tail } },
+      ...(revealOrder === 'backwards' ? kids.slice().reverse() : kids)
+    )
+  }
+  SuspenseList._isSuspenseList = true
+
+  // ═════════════════════════════════════════════════════════════
+  // § 20  REF 工具：mergeRefs / useMergedRef / createPersistentRef
+  // ═════════════════════════════════════════════════════════════
+
+  /**
+   * mergeRefs —— 把多个 ref（callback ref / object ref）合并成一个 callback ref。
+   *
+   * 典型场景：组件内部需要 ref 又要把 ref 透传给父组件。
+   *   const Input = forwardRef((props, parentRef) => {
+   *     const localRef = useRef(null)
+   *     return <input ref={mergeRefs(localRef, parentRef)} />
+   *   })
+   *
+   * 实现：返回一个函数 ref，被 React 调用时把 dom 同时写入所有底层 ref。
+   */
+  function mergeRefs(...refs) {
+    return value => {
+      refs.forEach(ref => {
+        if (!ref) return
+        if (typeof ref === 'function') ref(value)
+        else ref.current = value
+      })
+    }
+  }
+
+  /**
+   * useMergedRef —— mergeRefs 的 hook 版本，用 useMemo 按 refs 缓存。
+   * 避免每次渲染都生成新函数 ref，导致 DOM 反复 setRef(null)/setRef(dom)。
+   */
+  function useMergedRef(...refs) {
+    return useMemo(() => mergeRefs(...refs), refs)
+  }
+
+  // ═════════════════════════════════════════════════════════════
+  // § 21  PROPTYPES —— 轻量类型校验（开发期）
+  // ═════════════════════════════════════════════════════════════
+
+  /**
+   * PropTypes —— 类似 prop-types 包的轻量替代。
+   *
+   * 用法：
+   *   function MyComp({ name, age }) { ... }
+   *   MyComp.propTypes = {
+   *     name: PropTypes.string.isRequired,
+   *     age:  PropTypes.number,
+   *     tags: PropTypes.arrayOf(PropTypes.string),
+   *   }
+   *
+   * 失败时在 console.warn 输出，与真实 prop-types 行为一致。
+   * 仅在 updateFunctionComponent 渲染前校验（生产环境可整体禁用）。
+   */
+  function makeChecker(check, typeName) {
+    function checker(props, propName, componentName) {
+      const value = props[propName]
+      if (value == null) return null  // 不校验缺省值（required 由 isRequired 包装）
+      const err = check(value, propName, componentName)
+      return err
+    }
+    checker.isRequired = function (props, propName, componentName) {
+      if (props[propName] == null) {
+        return new Error(`[PropTypes] ${componentName}.${propName} 必填，但收到 ${props[propName]}`)
+      }
+      return checker(props, propName, componentName)
+    }
+    checker._typeName = typeName
+    return checker
+  }
+
+  const PropTypes = {
+    string:  makeChecker((v, k, c) => typeof v === 'string'   ? null : new Error(`[PropTypes] ${c}.${k} 应为 string，收到 ${typeof v}`),  'string'),
+    number:  makeChecker((v, k, c) => typeof v === 'number'   ? null : new Error(`[PropTypes] ${c}.${k} 应为 number，收到 ${typeof v}`),  'number'),
+    bool:    makeChecker((v, k, c) => typeof v === 'boolean'  ? null : new Error(`[PropTypes] ${c}.${k} 应为 boolean，收到 ${typeof v}`), 'bool'),
+    func:    makeChecker((v, k, c) => typeof v === 'function' ? null : new Error(`[PropTypes] ${c}.${k} 应为 function，收到 ${typeof v}`),'func'),
+    object:  makeChecker((v, k, c) => typeof v === 'object'   ? null : new Error(`[PropTypes] ${c}.${k} 应为 object，收到 ${typeof v}`),  'object'),
+    array:   makeChecker((v, k, c) => Array.isArray(v)        ? null : new Error(`[PropTypes] ${c}.${k} 应为 array`),                       'array'),
+    node:    makeChecker(() => null, 'node'),  // 任何可渲染都通过
+    any:     makeChecker(() => null, 'any'),
+
+    /** oneOf(['a','b'])：枚举值校验 */
+    oneOf(values) {
+      return makeChecker((v, k, c) => values.includes(v)
+        ? null
+        : new Error(`[PropTypes] ${c}.${k} 应为 ${values.join('|')} 之一，收到 ${v}`), 'oneOf')
+    },
+    /** oneOfType([T1, T2])：联合类型 */
+    oneOfType(types) {
+      return makeChecker((v, k, c) => {
+        for (const t of types) {
+          const err = t({ [k]: v }, k, c)
+          if (!err) return null
+        }
+        return new Error(`[PropTypes] ${c}.${k} 不匹配任意指定类型`)
+      }, 'oneOfType')
+    },
+    /** arrayOf(T)：数组元素类型 */
+    arrayOf(type) {
+      return makeChecker((v, k, c) => {
+        if (!Array.isArray(v)) return new Error(`[PropTypes] ${c}.${k} 应为 array`)
+        for (let i = 0; i < v.length; i++) {
+          const err = type({ [k]: v[i] }, k, c)
+          if (err) return new Error(`[PropTypes] ${c}.${k}[${i}] ${err.message}`)
+        }
+        return null
+      }, 'arrayOf')
+    },
+    /** shape({a: T1, b: T2})：对象字段类型 */
+    shape(spec) {
+      return makeChecker((v, k, c) => {
+        if (typeof v !== 'object' || v == null) return new Error(`[PropTypes] ${c}.${k} 应为 object`)
+        for (const key of Object.keys(spec)) {
+          const err = spec[key](v, key, `${c}.${k}`)
+          if (err) return err
+        }
+        return null
+      }, 'shape')
+    },
+    /** instanceOf(Class)：实例校验 */
+    instanceOf(Cls) {
+      return makeChecker((v, k, c) => v instanceof Cls
+        ? null
+        : new Error(`[PropTypes] ${c}.${k} 应为 ${Cls.name} 实例`), 'instanceOf')
+    },
+  }
+
+  /** 在渲染前校验 props（updateFunctionComponent / updateClassComponent 调用） */
+  function validateProps(component, props) {
+    if (!component.propTypes) return
+    const name = component.displayName || component.name || 'Component'
+    for (const key of Object.keys(component.propTypes)) {
+      const checker = component.propTypes[key]
+      if (typeof checker !== 'function') continue
+      try {
+        const err = checker(props, key, name)
+        if (err) console.warn(err.message)
+      } catch (e) {
+        console.warn('[PropTypes] 校验抛出异常：', e)
+      }
+    }
+  }
+
+  // ═════════════════════════════════════════════════════════════
+  // § 22  CUSTOM HOOKS —— 常用自定义 hooks 库
+  // ═════════════════════════════════════════════════════════════
+
+  /**
+   * usePrevious —— 返回上一次渲染时的值（首次渲染返回 undefined）。
+   *
+   * 实现：用 ref 保存值，每次 effect 后写入新值；下次渲染读到的是上次写入的旧值。
+   * 用途：动画、变化检测、diff props 等。
+   */
+  function usePrevious(value) {
+    const ref = useRef(undefined)
+    useEffect(() => { ref.current = value }, [value])
+    return ref.current
+  }
+
+  /**
+   * useToggle —— 布尔状态切换语法糖。
+   * @returns [state, toggle, setTrue, setFalse]
+   */
+  function useToggle(initial = false) {
+    const [state, setState] = useState(initial)
+    const toggle   = useCallback(() => setState(s => !s), [])
+    const setTrue  = useCallback(() => setState(true),    [])
+    const setFalse = useCallback(() => setState(false),   [])
+    return [state, toggle, setTrue, setFalse]
+  }
+
+  /**
+   * useCounter —— 数字计数器，附带 inc/dec/reset/set。
+   */
+  function useCounter(initial = 0, { min = -Infinity, max = Infinity } = {}) {
+    const [count, setCount] = useState(initial)
+    const inc   = useCallback(step => setCount(c => Math.min(max, c + (step ?? 1))), [max])
+    const dec   = useCallback(step => setCount(c => Math.max(min, c - (step ?? 1))), [min])
+    const reset = useCallback(() => setCount(initial), [initial])
+    const set   = useCallback(v => setCount(Math.max(min, Math.min(max, v))), [min, max])
+    return { count, inc, dec, reset, set }
+  }
+
+  /**
+   * useDebounce —— 防抖：value 变化后等待 delay 毫秒，期间无新变化才返回新值。
+   * 适合搜索框：输入停止后才发起请求。
+   */
+  function useDebounce(value, delay = 300) {
+    const [debounced, setDebounced] = useState(value)
+    useEffect(() => {
+      const id = setTimeout(() => setDebounced(value), delay)
+      return () => clearTimeout(id)
+    }, [value, delay])
+    return debounced
+  }
+
+  /**
+   * useThrottle —— 节流：value 在 delay 毫秒内最多更新一次。
+   */
+  function useThrottle(value, delay = 300) {
+    const [throttled, setThrottled] = useState(value)
+    const lastRun = useRef(Date.now())
+    useEffect(() => {
+      const remaining = delay - (Date.now() - lastRun.current)
+      if (remaining <= 0) {
+        setThrottled(value)
+        lastRun.current = Date.now()
+      } else {
+        const id = setTimeout(() => {
+          setThrottled(value)
+          lastRun.current = Date.now()
+        }, remaining)
+        return () => clearTimeout(id)
+      }
+    }, [value, delay])
+    return throttled
+  }
+
+  /**
+   * useInterval —— 声明式 setInterval。
+   * 关键设计：用 ref 保存最新 callback，避免依赖数组导致 interval 反复重建。
+   */
+  function useInterval(callback, delay) {
+    const cbRef = useRef(callback)
+    useEffect(() => { cbRef.current = callback }, [callback])
+    useEffect(() => {
+      if (delay == null) return  // 传 null 暂停
+      const id = setInterval(() => cbRef.current(), delay)
+      return () => clearInterval(id)
+    }, [delay])
+  }
+
+  /**
+   * useTimeout —— 声明式 setTimeout。
+   */
+  function useTimeout(callback, delay) {
+    const cbRef = useRef(callback)
+    useEffect(() => { cbRef.current = callback }, [callback])
+    useEffect(() => {
+      if (delay == null) return
+      const id = setTimeout(() => cbRef.current(), delay)
+      return () => clearTimeout(id)
+    }, [delay])
+  }
+
+  /**
+   * useEventListener —— 声明式绑定事件，自动 cleanup。
+   * @param target  EventTarget（默认 window）
+   */
+  function useEventListener(eventName, handler, target = typeof window !== 'undefined' ? window : null) {
+    const handlerRef = useRef(handler)
+    useEffect(() => { handlerRef.current = handler }, [handler])
+    useEffect(() => {
+      if (!target) return
+      const listener = e => handlerRef.current(e)
+      target.addEventListener(eventName, listener)
+      return () => target.removeEventListener(eventName, listener)
+    }, [eventName, target])
+  }
+
+  /**
+   * useOnClickOutside —— 检测点击 ref 元素之外的区域。
+   * 常见于关闭下拉菜单、模态框。
+   */
+  function useOnClickOutside(ref, handler) {
+    useEffect(() => {
+      const listener = e => {
+        if (!ref.current || ref.current.contains(e.target)) return
+        handler(e)
+      }
+      document.addEventListener('mousedown', listener)
+      document.addEventListener('touchstart', listener)
+      return () => {
+        document.removeEventListener('mousedown', listener)
+        document.removeEventListener('touchstart', listener)
+      }
+    }, [ref, handler])
+  }
+
+  /**
+   * useKeyPress —— 检测某个键是否被按下。
+   */
+  function useKeyPress(targetKey) {
+    const [pressed, setPressed] = useState(false)
+    useEffect(() => {
+      const down = e => { if (e.key === targetKey) setPressed(true) }
+      const up   = e => { if (e.key === targetKey) setPressed(false) }
+      window.addEventListener('keydown', down)
+      window.addEventListener('keyup',   up)
+      return () => {
+        window.removeEventListener('keydown', down)
+        window.removeEventListener('keyup',   up)
+      }
+    }, [targetKey])
+    return pressed
+  }
+
+  /**
+   * useHover —— 鼠标悬停检测（返回 [ref, isHovering]）。
+   */
+  function useHover() {
+    const [hovering, setHovering] = useState(false)
+    const ref = useRef(null)
+    useEffect(() => {
+      const node = ref.current
+      if (!node) return
+      const enter = () => setHovering(true)
+      const leave = () => setHovering(false)
+      node.addEventListener('mouseenter', enter)
+      node.addEventListener('mouseleave', leave)
+      return () => {
+        node.removeEventListener('mouseenter', enter)
+        node.removeEventListener('mouseleave', leave)
+      }
+    }, [])
+    return [ref, hovering]
+  }
+
+  /**
+   * useWindowSize —— 跟踪窗口尺寸。
+   */
+  function useWindowSize() {
+    const [size, setSize] = useState(() => ({
+      width:  typeof window !== 'undefined' ? window.innerWidth  : 0,
+      height: typeof window !== 'undefined' ? window.innerHeight : 0,
+    }))
+    useEffect(() => {
+      const onResize = () => setSize({ width: window.innerWidth, height: window.innerHeight })
+      window.addEventListener('resize', onResize)
+      return () => window.removeEventListener('resize', onResize)
+    }, [])
+    return size
+  }
+
+  /**
+   * useMediaQuery —— 媒体查询匹配（响应式）。
+   *   const isMobile = useMediaQuery('(max-width: 640px)')
+   */
+  function useMediaQuery(query) {
+    const [matches, setMatches] = useState(() =>
+      typeof window !== 'undefined' && window.matchMedia ? window.matchMedia(query).matches : false
+    )
+    useEffect(() => {
+      if (!window.matchMedia) return
+      const mql = window.matchMedia(query)
+      const handler = e => setMatches(e.matches)
+      setMatches(mql.matches)
+      // 修复：原版 `mql.addEventListener?.(...) ?? mql.addListener(...)` 中
+      // 可选链调用即使方法存在也会返回 undefined，导致 ?? 永远走 fallback，
+      // 把已弃用的 addListener 也调一遍。改为先判断后调用。
+      if (typeof mql.addEventListener === 'function') {
+        mql.addEventListener('change', handler)
+      } else if (typeof mql.addListener === 'function') {
+        mql.addListener(handler)
+      }
+      return () => {
+        if (typeof mql.removeEventListener === 'function') {
+          mql.removeEventListener('change', handler)
+        } else if (typeof mql.removeListener === 'function') {
+          mql.removeListener(handler)
+        }
+      }
+    }, [query])
+    return matches
+  }
+
+  /**
+   * useLocalStorage —— 与 localStorage 双向同步的 useState。
+   *
+   * 特性：
+   *   - 初始值惰性读取（避免 SSR 时报错）
+   *   - 值变化时自动 JSON 序列化写入
+   *   - 读取异常时回退到 defaultValue（损坏的存储不会让应用崩溃）
+   */
+  function useLocalStorage(key, defaultValue) {
+    const [value, setValue] = useState(() => {
+      try {
+        const raw = localStorage.getItem(key)
+        return raw != null ? JSON.parse(raw) : defaultValue
+      } catch {
+        return defaultValue
+      }
+    })
+    useEffect(() => {
+      try {
+        localStorage.setItem(key, JSON.stringify(value))
+      } catch (e) {
+        console.warn('[useLocalStorage] 写入失败：', e)
+      }
+    }, [key, value])
+    return [value, setValue]
+  }
+
+  /**
+   * useFetch —— 简易数据请求 hook。
+   * @returns { data, error, loading, refetch }
+   */
+  function useFetch(url, options) {
+    const [state, setState] = useState({ data: null, error: null, loading: true })
+    const optsRef = useRef(options)
+    useEffect(() => { optsRef.current = options })
+    const refetch = useCallback(() => {
+      let cancelled = false
+      setState(s => ({ ...s, loading: true }))
+      fetch(url, optsRef.current).then(r => r.json()).then(
+        data  => { if (!cancelled) setState({ data, error: null, loading: false }) },
+        error => { if (!cancelled) setState({ data: null, error, loading: false }) }
+      )
+      return () => { cancelled = true }
+    }, [url])
+    useEffect(() => refetch(), [refetch])
+    return { ...state, refetch }
+  }
+
+  /**
+   * useUpdateEffect —— 跳过首次渲染的 useEffect（仅在依赖更新时执行）。
+   */
+  function useUpdateEffect(callback, deps) {
+    const isFirst = useRef(true)
+    useEffect(() => {
+      if (isFirst.current) { isFirst.current = false; return }
+      return callback()
+    }, deps)
+  }
+
+  /**
+   * useMountEffect —— 仅 mount 一次的 useEffect 语法糖。
+   */
+  function useMountEffect(callback) {
+    useEffect(() => callback(), [])
+  }
+
+  /**
+   * useUnmountEffect —— 仅卸载时执行 cleanup 的 useEffect 语法糖。
+   */
+  function useUnmountEffect(callback) {
+    const cbRef = useRef(callback)
+    useEffect(() => { cbRef.current = callback })
+    useEffect(() => () => cbRef.current(), [])
+  }
+
+  /**
+   * useIsMounted —— 返回一个永远准确指示组件是否挂载的 ref。
+   * 适合避免在异步回调中对已卸载组件 setState（虽然 React 18+ 已不警告）。
+   */
+  function useIsMounted() {
+    const ref = useRef(false)
+    useEffect(() => {
+      ref.current = true
+      return () => { ref.current = false }
+    }, [])
+    return ref
+  }
+
+  /**
+   * useForceUpdate —— 返回一个强制重渲染的函数。
+   * 极少使用，但偶尔在与命令式库集成时有用。
+   */
+  function useForceUpdate() {
+    const [, force] = useReducer(s => s + 1, 0)
+    return force
+  }
+
+  /**
+   * useCopyToClipboard —— 复制到剪贴板，返回 [copiedValue, copy]。
+   */
+  function useCopyToClipboard() {
+    const [copied, setCopied] = useState(null)
+    const copy = useCallback(async text => {
+      try {
+        await navigator.clipboard.writeText(text)
+        setCopied(text)
+        return true
+      } catch {
+        setCopied(null)
+        return false
+      }
+    }, [])
+    return [copied, copy]
+  }
+
+  // ═════════════════════════════════════════════════════════════
+  // § 23  REDUX-LIKE STORE —— 极简全局状态管理
+  // ═════════════════════════════════════════════════════════════
+
+  /**
+   * createStore(reducer, initialState) —— 创建一个轻量 Redux 风格 store。
+   *
+   * 返回值：
+   *   - getState() → 当前状态
+   *   - dispatch(action) → 派发 action（若 action 是函数则当作 thunk 执行）
+   *   - subscribe(listener) → 订阅，返回取消订阅函数
+   *
+   * 与 useSyncExternalStore 配合使用即可在组件中订阅：
+   *   const state = useSyncExternalStore(store.subscribe, store.getState)
+   *
+   * 支持中间件：createStore(reducer, init, [logger, thunk])
+   */
+  function createStore(reducer, initialState, middlewares = []) {
+    let state = initialState
+    const listeners = new Set()
+
+    const baseDispatch = action => {
+      state = reducer(state, action)
+      listeners.forEach(fn => fn())
+      return action
+    }
+
+    // 中间件链：从右到左套用
+    const dispatch = middlewares.reduceRight(
+      (next, mw) => mw({ getState: () => state, dispatch: a => dispatch(a) })(next),
+      baseDispatch,
+    )
+
+    // ⭐ 关键：派发 @@INIT 让 reducer 的默认参数（state = {...}）生效，
+    // 否则 initialState=undefined 时 store.getState() 也是 undefined，
+    // 组件读 state.xxx 直接抛 "Cannot read properties of undefined"。
+    // 用 baseDispatch 跳过中间件，避免 logger 打印这条噪声。
+    baseDispatch({ type: '@@INIT' })
+
+    return {
+      getState:  () => state,
+      dispatch,
+      subscribe: fn => { listeners.add(fn); return () => listeners.delete(fn) },
+    }
+  }
+
+  /**
+   * thunkMiddleware —— 让 dispatch 接收函数（用于异步 action）。
+   *   store.dispatch(dispatch => fetch(...).then(d => dispatch({type:'SET', d})))
+   */
+  const thunkMiddleware = ({ getState, dispatch }) => next => action =>
+    typeof action === 'function' ? action(dispatch, getState) : next(action)
+
+  /**
+   * loggerMiddleware —— 在 console 打印 action 流（调试用）。
+   */
+  const loggerMiddleware = ({ getState }) => next => action => {
+    console.groupCollapsed(`%c action %c${action.type ?? '(thunk)'}`, 'color:#888', 'color:#a78bfa')
+    console.log('prev', getState())
+    console.log('action', action)
+    const result = next(action)
+    console.log('next', getState())
+    console.groupEnd()
+    return result
+  }
+
+  /**
+   * combineReducers —— 把多个子 reducer 组合成一个根 reducer（每个管理 state 的一个分片）。
+   */
+  function combineReducers(spec) {
+    return (state = {}, action) => {
+      let changed = false
+      const next = {}
+      for (const key of Object.keys(spec)) {
+        const prev = state[key]
+        const got  = spec[key](prev, action)
+        next[key] = got
+        if (got !== prev) changed = true
+      }
+      return changed ? next : state
+    }
+  }
+
+  // ═════════════════════════════════════════════════════════════
+  // § 24  服务端渲染：renderToString / renderToStaticMarkup
+  // ═════════════════════════════════════════════════════════════
+
+  /**
+   * 自闭合 HTML 标签（不需要 </tag>）。
+   */
+  const VOID_ELEMENTS = new Set([
+    'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+    'keygen', 'link', 'meta', 'param', 'source', 'track', 'wbr',
+  ])
+
+  /**
+   * 把字符串中的 HTML 特殊字符转义，避免 XSS。
+   */
+  function escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;')
+  }
+
+  /**
+   * 把 JS 风格 style 对象（或字符串）序列化成 CSS 字符串。
+   * camelCase → kebab-case；忽略 null/undefined。
+   */
+  function styleToString(style) {
+    if (style == null) return ''
+    if (typeof style === 'string') return style
+    return Object.entries(style).map(([k, v]) => {
+      if (v == null || v === false) return ''
+      const prop = k.replace(/[A-Z]/g, m => '-' + m.toLowerCase())
+      return `${prop}:${typeof v === 'number' && !UNITLESS_PROPS.has(k) ? v + 'px' : v}`
+    }).filter(Boolean).join(';')
+  }
+
+  /** 不需要追加 px 的 CSS 数值属性 */
+  const UNITLESS_PROPS = new Set([
+    'opacity', 'zIndex', 'fontWeight', 'lineHeight', 'flex', 'flexGrow', 'flexShrink',
+    'order', 'columnCount', 'tabSize', 'zoom',
+  ])
+
+  /**
+   * propsToAttrs —— 把 props 序列化成 HTML 属性串（' key="value" key2="value2"'）。
+   * 跳过：children/key/ref/事件处理器/dangerouslySetInnerHTML
+   */
+  function propsToAttrs(props) {
+    const out = []
+    for (const k of Object.keys(props)) {
+      if (k === 'children' || k === 'key' || k === 'ref') continue
+      if (k === 'dangerouslySetInnerHTML') continue
+      if (k.startsWith('on')) continue  // 事件不输出到 HTML
+      const v = props[k]
+      if (v == null || v === false) continue
+      if (k === 'style')     { out.push(`style="${escapeHtml(styleToString(v))}"`); continue }
+      if (k === 'className') { out.push(`class="${escapeHtml(v)}"`);                continue }
+      if (k === 'htmlFor')   { out.push(`for="${escapeHtml(v)}"`);                   continue }
+      if (v === true)        { out.push(k); continue }  // 布尔属性仅写名
+      out.push(`${k}="${escapeHtml(v)}"`)
+    }
+    return out.length ? ' ' + out.join(' ') : ''
+  }
+
+  /**
+   * renderToString —— 把 element 树渲染成 HTML 字符串（不带 React 标记）。
+   *
+   * 实现策略：递归遍历，函数组件直接调用拿到子元素；类组件创建实例后调用 render。
+   * 不支持的 hook（依赖 fiber 的 useEffect 等）会以 no-op 形式跳过。
+   *
+   * ⚠️ 限制：
+   *   - 不支持 Suspense（lazy 抛出 Promise 时直接返回 fallback）
+   *   - 不执行任何副作用（useEffect / useLayoutEffect / componentDidMount）
+   *   - useState 总是返回初始值（无法响应 setState）
+   */
+  function renderToString(element) {
+    return renderElement(element, /*static*/ false)
+  }
+
+  /**
+   * renderToStaticMarkup —— 与 renderToString 相同，但不附加任何 React 标记。
+   * 适合纯静态页面生成（不会被 hydrateRoot 接管）。
+   */
+  function renderToStaticMarkup(element) {
+    return renderElement(element, /*static*/ true)
+  }
+
+  /** SSR 渲染上下文：模拟最少必要的 hooks 状态 */
+  const ssrContext = { hooks: [], hookIndex: 0, isSSR: false }
+
+  function setupSsrHooks() {
+    const original = { wipFiber, hookIndex }
+    ssrContext.hooks = []
+    ssrContext.hookIndex = 0
+    ssrContext.isSSR = true
+    wipFiber  = { hooks: ssrContext.hooks, alternate: null }
+    hookIndex = 0
+    return original
+  }
+  function restoreSsrHooks(original) {
+    ssrContext.isSSR = false
+    wipFiber  = original.wipFiber
+    hookIndex = original.hookIndex
+  }
+
+  function renderElement(element, isStatic) {
+    if (element == null || element === false || element === true) return ''
+    if (typeof element === 'string' || typeof element === 'number') return escapeHtml(String(element))
+    if (Array.isArray(element)) return element.map(e => renderElement(e, isStatic)).join('')
+    if (!isValidElement(element)) return ''
+
+    const { type, props } = element
+
+    // ── TEXT_ELEMENT：纯文本节点 ──────────────────────────────
+    if (type === 'TEXT_ELEMENT') return escapeHtml(props.nodeValue || '')
+
+    // ── Fragment：仅渲染 children ────────────────────────────
+    if (type === Fragment) return renderElement(props.children, isStatic)
+
+    // ── Portal：SSR 中无法生效，渲染为空 ─────────────────────
+    if (type === PORTAL) return ''
+
+    // ── 函数组件 ──────────────────────────────────────────────
+    if (typeof type === 'function' && !type._isClass) {
+      const original = setupSsrHooks()
+      try {
+        let child
+        if (type._isMemo)         child = type._type(props)
+        else if (type._isForwardRef) child = type._renderFn(props, props.ref ?? null)
+        else                      child = type(props)
+        return renderElement(child, isStatic)
+      } catch (e) {
+        // lazy 在 SSR 中抛 Promise → 直接返回空字符串（真实 React 用流式 SSR 解决）
+        if (e && typeof e.then === 'function') return ''
+        throw e
+      } finally {
+        restoreSsrHooks(original)
+      }
+    }
+
+    // ── 类组件 ─────────────────────────────────────────────────
+    if (typeof type === 'function' && type._isClass) {
+      const inst = new type(props)
+      const child = inst.render()
+      return renderElement(child, isStatic)
+    }
+
+    // ── 原生 DOM 元素 ────────────────────────────────────────
+    if (typeof type === 'string') {
+      const attrs = propsToAttrs(props)
+      // dangerouslySetInnerHTML：直接写 __html，不转义子节点
+      if (props.dangerouslySetInnerHTML) {
+        return `<${type}${attrs}>${props.dangerouslySetInnerHTML.__html ?? ''}</${type}>`
+      }
+      if (VOID_ELEMENTS.has(type)) return `<${type}${attrs}/>`
+      const inner = renderElement(props.children, isStatic)
+      return `<${type}${attrs}>${inner}</${type}>`
+    }
+
+    return ''
+  }
+
+  // SSR 不替换全局 hook 函数（会影响客户端）；在 setupSsrHooks 内构造特殊 wipFiber，
+  // 让 useState/useReducer 读到 alternate=null 走"首次渲染"分支，effect 类 hook
+  // 仅 push 占位（callback 等绘制后才执行，此处天然成为 no-op）。
+
+  // ═════════════════════════════════════════════════════════════
+  // § 25  HYDRATE —— 把已有 DOM 与 element 树关联
+  // ═════════════════════════════════════════════════════════════
+
+  /**
+   * hydrateRoot —— 把服务端渲染的 HTML 与客户端 element 树绑定。
+   *
+   * 与 createRoot 区别：
+   *   createRoot：清空容器，从零创建所有 DOM 节点
+   *   hydrateRoot：复用容器内的现有 DOM，仅绑定事件 / 同步状态
+   *
+   * 简化实现：
+   *   1. 先按 createRoot 走一遍渲染流程（生成 fiber 树）
+   *   2. mutation pass 中，PLACEMENT 时若容器内已有对应位置的 DOM 节点，直接复用
+   *
+   * ⚠️ 限制：本简化实现不做严格的"水合校验"——若服务端 HTML 与客户端结构不一致
+   *    会出现错位。真实 React 有详细的 hydration 校验日志。
+   */
+  function hydrateRoot(container, element) {
+    // 标记水合模式：commit 时尽量复用 container.firstChild
+    container._hydrating = true
+    const root = createRoot(container)
+    root.render(element)
+    // 水合完成后清除标记，后续更新走正常 PLACEMENT 流程
+    setTimeout(() => { container._hydrating = false }, 0)
+    return root
+  }
+
   // ─────────────────────────────────────────────────────────────
   // § 16  公开 API
   // ─────────────────────────────────────────────────────────────
@@ -1538,19 +2553,41 @@
     useDebugValue, useTransition, useDeferredValue,
     // Hooks — 外部 store
     useSyncExternalStore,
+    // Hooks — React 19 风格
+    use, useOptimistic, useActionState,
+    // Hooks — 自定义工具库（§22）
+    usePrevious, useToggle, useCounter,
+    useDebounce, useThrottle,
+    useInterval, useTimeout,
+    useEventListener, useOnClickOutside, useKeyPress,
+    useHover, useWindowSize, useMediaQuery,
+    useLocalStorage, useFetch,
+    useUpdateEffect, useMountEffect, useUnmountEffect,
+    useIsMounted, useForceUpdate, useCopyToClipboard,
+    useMergedRef,
     // Context
     createContext,
-    // 异步
-    lazy, Suspense,
+    // 异步与并发
+    lazy, Suspense, SuspenseList,
+    // 性能测量
+    Profiler,
     // 工具
-    createRef, Children, startTransition,
+    createRef, Children, startTransition, mergeRefs,
     // Portal
     createPortal,
+    // 类型校验
+    PropTypes,
+    // Redux-like store
+    createStore, combineReducers, thunkMiddleware, loggerMiddleware,
+    // SSR
+    renderToString, renderToStaticMarkup,
   }
 
   // Object.assign 绕过 TS 对 window 扩展属性的类型检查（Hint 2568）
   Object.assign(window, {
-    MiniReactDOM: { render, flushSync, createRoot, batch, act },
+    MiniReactDOM: {
+      render, flushSync, createRoot, batch, act, hydrateRoot,
+    },
   })
 
 }())

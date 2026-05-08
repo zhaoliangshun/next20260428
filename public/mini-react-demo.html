@@ -199,11 +199,26 @@
     useRef, useMemo, useCallback, useId,
     useContext, createContext, memo, createRef, Children,
     forwardRef, useImperativeHandle, useTransition, useDeferredValue,
-    createPortal, lazy, Suspense,
+    createPortal, lazy, Suspense, SuspenseList,
     useSyncExternalStore,
     Component, PureComponent,
+    // 新增
+    use, useOptimistic, useActionState,
+    Profiler,
+    mergeRefs, useMergedRef,
+    PropTypes,
+    createStore, combineReducers, thunkMiddleware, loggerMiddleware,
+    renderToString, renderToStaticMarkup,
+    // 自定义 hooks
+    usePrevious, useToggle, useCounter,
+    useDebounce, useThrottle,
+    useInterval, useTimeout,
+    useEventListener, useOnClickOutside, useKeyPress,
+    useHover, useWindowSize, useMediaQuery,
+    useLocalStorage, useFetch,
+    useUpdateEffect, useForceUpdate, useCopyToClipboard,
   } = window.MiniReact
-  const { render, flushSync, act } = window.MiniReactDOM
+  const { render, flushSync, act, hydrateRoot } = window.MiniReactDOM
 
   // ─────────────────────────────────────────────────────────────
   // Demo 1：useState —— 基础状态管理
@@ -1137,6 +1152,580 @@
     )
   }
 
+  // ═════════════════════════════════════════════════════════════
+  // 高级 Demo（React 19 风格 + 自定义 hooks 库）
+  // ═════════════════════════════════════════════════════════════
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 23：use() —— 在渲染中读取 Promise
+  // ─────────────────────────────────────────────────────────────
+  // use() 把"未 resolve 的 Promise"抛出，由最近的 Suspense 接住显示 fallback
+  function makeUserPromise(id) {
+    return new Promise(resolve => {
+      setTimeout(() => resolve({
+        id,
+        name: ['Alice', 'Bob', 'Carol'][id % 3],
+        avatar: ['🎨', '🚀', '🦊'][id % 3],
+      }), 1500)
+    })
+  }
+  // 关键：Promise 必须在组件外创建（同一个引用复用），否则每次渲染都挂起
+  let _userPromiseCache = makeUserPromise(0)
+
+  function UserCard() {
+    // use() 直接读 Promise 拿到结果（pending 时抛出触发 Suspense）
+    const user = use(_userPromiseCache)
+    return h('div', { style: { padding: '12px', background: '#111', borderRadius: '8px' } },
+      h('div', { style: { fontSize: '2rem', textAlign: 'center' } }, user.avatar),
+      h('div', { style: { textAlign: 'center', color: '#6ee7f7', marginTop: '4px' } },
+        `${user.name} (id=${user.id})`)
+    )
+  }
+
+  function UseHookDemo() {
+    const [tick, setTick] = useState(0)
+    const reload = () => {
+      _userPromiseCache = makeUserPromise(tick + 1)
+      setTick(t => t + 1)
+    }
+    return h('div', null,
+      h('p', { style: { fontSize: '0.8rem', color: '#888', marginBottom: '8px' } },
+        'use() 直接读 Promise，未完成时由 Suspense 显示 fallback'),
+      h(Suspense, {
+        key: tick,  // 切换 key 强制重新挂载
+        fallback: h('p', { style: { color: '#a78bfa', textAlign: 'center', padding: '20px' } },
+          '⏳ 加载用户中…'),
+      }, h(UserCard, null)),
+      h('button', { onClick: reload, style: { marginTop: '10px' } }, '重新加载')
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 24：useOptimistic —— 乐观 UI 更新
+  // ─────────────────────────────────────────────────────────────
+  function OptimisticDemo() {
+    const [messages, setMessages] = useState([
+      { id: 1, text: '欢迎来到 Mini React！', sending: false },
+    ])
+    // useOptimistic：在真实 state 之上叠加待定消息
+    const [optimisticMessages, addOptimistic] = useOptimistic(
+      messages,
+      (state, payload) => [...state, { id: payload.id, text: payload.text, sending: true }],
+    )
+    const [text, setText] = useState('')
+
+    const send = async () => {
+      if (!text.trim()) return
+      const tempId = Date.now()
+      const content = text.trim()
+      setText('')
+      // 1. 立刻显示"发送中"消息（乐观更新）
+      addOptimistic({ id: tempId, text: content })
+      // 2. 模拟网络延迟（1.2 秒）
+      await new Promise(r => setTimeout(r, 1200))
+      // 3. 服务器响应：写入真实 state（乐观状态自动作废）
+      setMessages(prev => [...prev, { id: tempId, text: content, sending: false }])
+    }
+
+    return h('div', null,
+      h('p', { style: { fontSize: '0.8rem', color: '#888', marginBottom: '8px' } },
+        '点击发送：消息立刻出现（半透明），1.2 秒后转为已发送'),
+      h('div', { className: 'msg-list' },
+        optimisticMessages.map(m =>
+          h('div', { key: m.id, className: 'msg-item',
+            style: { opacity: m.sending ? 0.5 : 1, color: m.sending ? '#a78bfa' : '#94a3b8' }
+          }, `${m.sending ? '⏳ ' : '✓ '} ${m.text}`)
+        )
+      ),
+      h('div', { style: { display: 'flex', gap: '6px' } },
+        h('input', { type: 'text', value: text, onInput: e => setText(e.target.value),
+          onKeyDown: e => e.key === 'Enter' && send(), style: { flex: 1, marginBottom: 0 },
+          placeholder: '输入并回车发送…' }),
+        h('button', { onClick: send, style: { margin: 0 } }, '发送')
+      )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 25：useActionState —— 表单 action
+  // ─────────────────────────────────────────────────────────────
+  function ActionStateDemo() {
+    // action(prevState, formData) → Promise<newState>
+    const checkUsername = useCallback(async (prev, formData) => {
+      const name = formData.get('username')
+      await new Promise(r => setTimeout(r, 800))
+      if (!name)              return { ok: false, msg: '用户名不能为空' }
+      if (name.length < 3)    return { ok: false, msg: '至少 3 个字符' }
+      if (name === 'admin')   return { ok: false, msg: '该用户名已被占用' }
+      return { ok: true, msg: `✓ ${name} 可用` }
+    }, [])
+
+    const [state, dispatch, isPending] = useActionState(checkUsername, { ok: null, msg: '' })
+
+    const onSubmit = e => {
+      e.preventDefault()
+      const fd = new FormData(e.target)
+      dispatch(fd)
+    }
+
+    return h('form', { onSubmit },
+      h('p', { style: { fontSize: '0.8rem', color: '#888', marginBottom: '8px' } },
+        '提交后自动 disable 按钮直到 action 完成'),
+      h('input', { type: 'text', name: 'username', placeholder: '输入用户名（试试 admin）',
+        disabled: isPending }),
+      h('button', { type: 'submit', disabled: isPending, style: { marginTop: '4px' } },
+        isPending ? '检查中…' : '检查可用性'),
+      state.msg && h('p', {
+        style: {
+          marginTop: '8px',
+          color: state.ok ? '#10b981' : '#ef4444',
+          fontSize: '0.85rem',
+        }
+      }, state.msg)
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 26：Profiler —— 渲染性能测量
+  // ─────────────────────────────────────────────────────────────
+  function ExpensiveTree({ count }) {
+    // 故意做点耗时计算
+    const items = []
+    for (let i = 0; i < count; i++) {
+      items.push(h('span', { key: i, style: {
+        display: 'inline-block', width: '12px', height: '12px',
+        margin: '1px', background: `hsl(${(i * 7) % 360}, 60%, 55%)`, borderRadius: '2px',
+      }}))
+    }
+    return h('div', null, ...items)
+  }
+
+  function ProfilerDemo() {
+    const [count, setCount] = useState(50)
+    // ⚠️ 关键设计：日志写入 ref（不触发渲染），用独立 interval 把 ref 同步到显示状态。
+    // 如果在 onRender 内直接 setState，会触发新的 render → 新的 commit
+    // → Profiler.useLayoutEffect 再次触发 onRender → 死循环。
+    const logsRef = useRef([])
+    const [, force] = useReducer(s => s + 1, 0)
+
+    const onRender = useCallback((id, phase, duration) => {
+      logsRef.current = [
+        `[${phase}] ${id} 用时 ${duration.toFixed(2)}ms`,
+        ...logsRef.current.slice(0, 4)
+      ]
+    }, [])
+
+    // 每 300ms 把 ref 同步到 UI，避免 onRender → setState → 渲染循环
+    useEffect(() => {
+      const id = setInterval(() => force(), 300)
+      return () => clearInterval(id)
+    }, [])
+
+    return h('div', null,
+      h('p', { style: { fontSize: '0.8rem', color: '#888', marginBottom: '6px' } },
+        `渲染 ${count} 个色块，Profiler 统计耗时（日志每 300ms 刷新）`),
+      h(Profiler, { id: 'ColorGrid', onRender },
+        h(ExpensiveTree, { count })
+      ),
+      h('div', { style: { marginTop: '8px' } },
+        h('button', { onClick: () => setCount(c => Math.min(2000, c + 50)) }, '+50'),
+        h('button', { onClick: () => setCount(c => Math.max(10, c - 50)), className: 'ghost' }, '-50'),
+        h('button', { onClick: () => setCount(50), className: 'ghost' }, '重置'),
+      ),
+      h('div', { className: 'log' },
+        logsRef.current.map((l, i) => h('p', { key: i }, l))
+      )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 27：mergeRefs —— 同时绑定多个 ref
+  // ─────────────────────────────────────────────────────────────
+  function MergedRefInput({ outerRef }) {
+    const localRef  = useRef(null)
+    // 把外部 ref + 本地 ref 合并到同一个 input
+    const merged = useMergedRef(localRef, outerRef)
+    const [chars, setChars] = useState(0)
+    return h('div', null,
+      h('input', { ref: merged, type: 'text',
+        onInput: e => { setChars(e.target.value.length) },
+        placeholder: '本地 ref 与父 ref 同时指向我' }),
+      h('p', { style: { fontSize: '0.8rem', color: '#94a3b8' } }, `本地 ref 监听到长度：${chars}`)
+    )
+  }
+
+  function MergeRefsDemo() {
+    const parentRef = useRef(null)
+    return h('div', null,
+      h('p', { style: { fontSize: '0.8rem', color: '#888', marginBottom: '6px' } },
+        'mergeRefs 把多个 ref 合并到同一个 DOM 节点'),
+      h(MergedRefInput, { outerRef: parentRef }),
+      h('div', null,
+        h('button', { onClick: () => parentRef.current?.focus() }, '父 ref 聚焦'),
+        h('button', { className: 'ghost', onClick: () => {
+          if (parentRef.current) parentRef.current.value = '由父 ref 写入'
+        }}, '父 ref 写值'),
+      )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 28：PropTypes —— 运行时 prop 类型校验
+  // ─────────────────────────────────────────────────────────────
+  function TypedCard({ title, count, tags }) {
+    return h('div', { className: 'memo-panel' },
+      h('div', { style: { color: '#a78bfa', fontWeight: 600 } }, title),
+      h('div', { style: { color: '#6ee7f7', margin: '4px 0' } }, `数量：${count}`),
+      h('div', { style: { fontSize: '0.8rem', color: '#94a3b8' } },
+        `标签：${(tags || []).join(', ') || '(无)'}`)
+    )
+  }
+  TypedCard.propTypes = {
+    title: PropTypes.string.isRequired,
+    count: PropTypes.number,
+    tags:  PropTypes.arrayOf(PropTypes.string),
+  }
+
+  function PropTypesDemo() {
+    const [bad, setBad] = useState(false)
+    return h('div', null,
+      h('p', { style: { fontSize: '0.8rem', color: '#888', marginBottom: '8px' } },
+        '正常 props vs. 错误 props（错误会在 console 警告）'),
+      bad
+        ? h(TypedCard, { title: 123, count: 'not a number', tags: ['a', 999, 'b'] })
+        : h(TypedCard, { title: '正常卡片', count: 42, tags: ['react', 'mini', 'demo'] }),
+      h('button', { onClick: () => setBad(b => !b),
+        className: bad ? 'danger' : 'ghost', style: { marginTop: '8px' } },
+        bad ? '切回正常' : '触发类型错误（看 console）')
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 29：createStore + 中间件 —— Redux 风格全局状态
+  // ─────────────────────────────────────────────────────────────
+  // Reducer：根据 action 计算新 state
+  const todoReducer = (state = { items: [], filter: 'all' }, action) => {
+    switch (action.type) {
+      case 'ADD_TODO':
+        return { ...state, items: [...state.items, { id: Date.now(), text: action.text, done: false }] }
+      case 'TOGGLE_TODO':
+        return { ...state, items: state.items.map(t => t.id === action.id ? { ...t, done: !t.done } : t) }
+      case 'SET_FILTER':
+        return { ...state, filter: action.filter }
+      case 'CLEAR_DONE':
+        return { ...state, items: state.items.filter(t => !t.done) }
+      default: return state
+    }
+  }
+  // 创建 store 时挂上 logger 中间件，所有 dispatch 自动 console.log
+  const todoStore = createStore(todoReducer, undefined, [loggerMiddleware])
+
+  function ReduxStyleDemo() {
+    // 通过 useSyncExternalStore 订阅外部 store
+    const state = useSyncExternalStore(todoStore.subscribe, todoStore.getState)
+    const [text, setText] = useState('')
+
+    const visible = state.items.filter(t =>
+      state.filter === 'all' ? true : state.filter === 'done' ? t.done : !t.done
+    )
+
+    return h('div', null,
+      h('p', { style: { fontSize: '0.75rem', color: '#555', marginBottom: '6px' } },
+        'createStore + logger 中间件（dispatch 见 console）'),
+      h('div', { style: { display: 'flex', gap: '6px', marginBottom: '6px' } },
+        h('input', { type: 'text', value: text, onInput: e => setText(e.target.value),
+          onKeyDown: e => {
+            if (e.key === 'Enter' && text.trim()) {
+              todoStore.dispatch({ type: 'ADD_TODO', text: text.trim() })
+              setText('')
+            }
+          },
+          style: { flex: 1, marginBottom: 0 }, placeholder: '回车添加' }),
+      ),
+      h('div', { style: { display: 'flex', gap: '4px', marginBottom: '6px' } },
+        ['all', 'active', 'done'].map(f =>
+          h('button', { key: f,
+            className: state.filter === f ? '' : 'ghost',
+            onClick: () => todoStore.dispatch({ type: 'SET_FILTER', filter: f }),
+            style: { fontSize: '0.75rem', padding: '3px 8px', margin: 0 }
+          }, f === 'all' ? '全部' : f === 'done' ? '已完成' : '未完成')
+        ),
+        h('button', { className: 'ghost', style: { fontSize: '0.75rem', padding: '3px 8px', margin: 0 },
+          onClick: () => todoStore.dispatch({ type: 'CLEAR_DONE' }) }, '清除已完成')
+      ),
+      visible.length === 0
+        ? h('p', { style: { color: '#555', fontSize: '0.8rem' } }, '空空如也')
+        : visible.map(t =>
+            h('div', { key: t.id, className: `todo-item${t.done ? ' done' : ''}` },
+              h('input', { type: 'checkbox', checked: t.done,
+                onChange: () => todoStore.dispatch({ type: 'TOGGLE_TODO', id: t.id }) }),
+              h('span', { style: { flex: 1 } }, t.text)
+            )
+          )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 30：renderToString —— SSR 字符串输出
+  // ─────────────────────────────────────────────────────────────
+  function SSRDemo() {
+    const [name, setName] = useState('世界')
+    // 实时 SSR 渲染
+    const html = useMemo(() => renderToString(
+      h('div', { className: 'card-preview', style: { padding: '8px', border: '1px solid #2a2a3a' } },
+        h('h4', { style: { color: '#a78bfa' } }, `Hello, ${name}!`),
+        h('ul', null,
+          h('li', null, '组件树会被序列化为 HTML'),
+          h('li', null, '事件处理器会被剔除'),
+          h('li', null, '可用 hydrateRoot 接管交互')
+        )
+      )
+    ), [name])
+
+    return h('div', null,
+      h('p', { style: { fontSize: '0.8rem', color: '#888', marginBottom: '6px' } },
+        'renderToString 把组件树序列化成 HTML 字符串'),
+      h('input', { type: 'text', value: name, onInput: e => setName(e.target.value),
+        placeholder: '输入名字...' }),
+      h('p', { style: { fontSize: '0.78rem', color: '#94a3b8', margin: '6px 0 4px' } }, '生成的 HTML：'),
+      h('pre', {
+        style: {
+          background: '#0a0a14', color: '#6ee7f7',
+          padding: '8px', borderRadius: '6px',
+          fontSize: '0.7rem', overflow: 'auto', maxHeight: '120px',
+          whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+        }
+      }, html)
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 31：自定义 hooks —— useToggle / useDebounce / usePrevious
+  // ─────────────────────────────────────────────────────────────
+  function CustomHooksDemo() {
+    const [open, toggle, , close] = useToggle(false)
+    const [text, setText]    = useState('')
+    const debounced          = useDebounce(text, 500)
+    const prevDebounced      = usePrevious(debounced)
+    const { count, inc, dec, reset } = useCounter(0, { min: 0, max: 10 })
+
+    return h('div', null,
+      // useToggle
+      h('div', { style: { marginBottom: '10px' } },
+        h('button', { onClick: toggle }, open ? '收起' : '展开'),
+        h('button', { onClick: close, className: 'ghost' }, '强制关闭'),
+        open && h('p', { style: { color: '#6ee7f7', marginTop: '4px', fontSize: '0.85rem' } },
+          '✓ useToggle 控制的内容')
+      ),
+      // useDebounce + usePrevious
+      h('input', { type: 'text', value: text, onInput: e => setText(e.target.value),
+        placeholder: '快速输入：500ms 防抖' }),
+      h('p', { style: { fontSize: '0.78rem', color: '#94a3b8' } },
+        `当前：${text || '(空)'}`),
+      h('p', { style: { fontSize: '0.78rem', color: '#6ee7f7' } },
+        `防抖：${debounced || '(空)'} ｜ 上次防抖：${prevDebounced ?? '(无)'}`),
+      // useCounter
+      h('div', { style: { marginTop: '10px', display: 'flex', alignItems: 'center', gap: '6px' } },
+        h('span', { style: { color: '#a78bfa', minWidth: '6em', fontSize: '0.85rem' } },
+          `Counter: ${count}`),
+        h('button', { onClick: () => dec(), style: { margin: 0 } }, '−'),
+        h('button', { onClick: () => inc(), style: { margin: 0 } }, '+'),
+        h('button', { onClick: reset, className: 'ghost', style: { margin: 0 } }, '重置'),
+        h('span', { style: { fontSize: '0.7rem', color: '#555' } }, '范围 [0, 10]')
+      )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 32：useInterval / useKeyPress / useWindowSize
+  // ─────────────────────────────────────────────────────────────
+  function HooksObservabilityDemo() {
+    const [count, setCount]   = useState(0)
+    const [running, setRun]   = useState(true)
+    // 声明式 setInterval：传 null 暂停
+    useInterval(() => setCount(c => c + 1), running ? 1000 : null)
+    const spacePressed = useKeyPress(' ')
+    const { width, height } = useWindowSize()
+
+    return h('div', null,
+      h('div', { style: { display: 'flex', justifyContent: 'space-between', marginBottom: '8px' } },
+        h('span', { style: { color: '#6ee7f7', fontSize: '1.5rem', fontWeight: 700 } }, `${count}s`),
+        h('button', { onClick: () => setRun(r => !r), className: running ? 'danger' : '' },
+          running ? '暂停' : '继续')
+      ),
+      h('p', { style: { fontSize: '0.78rem', color: '#94a3b8' } },
+        `按住 [空格]：${spacePressed ? '✓ 已按下' : '...'}`),
+      h('p', { style: { fontSize: '0.78rem', color: '#94a3b8' } },
+        `窗口尺寸：${width} × ${height}`)
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 33：useOnClickOutside / useHover
+  // ─────────────────────────────────────────────────────────────
+  function ClickOutsideHoverDemo() {
+    const [open, setOpen] = useState(false)
+    const dropdownRef     = useRef(null)
+    // 点击 dropdown 之外的区域时关闭
+    useOnClickOutside(dropdownRef, () => setOpen(false))
+    const [hoverRef, isHovering] = useHover()
+
+    return h('div', null,
+      h('div', { ref: dropdownRef, style: { position: 'relative', marginBottom: '12px' } },
+        h('button', { onClick: () => setOpen(o => !o) }, open ? '收起菜单' : '打开菜单'),
+        open && h('div', {
+          style: {
+            position: 'absolute', top: '32px', left: 0, zIndex: 10,
+            background: '#1e1e2e', border: '1px solid #444',
+            borderRadius: '6px', padding: '6px', minWidth: '160px',
+          }
+        },
+          ['选项 A', '选项 B', '选项 C'].map(opt =>
+            h('div', { key: opt, style: {
+              padding: '4px 8px', cursor: 'pointer', fontSize: '0.85rem', color: '#ccc'
+            }}, opt)
+          ),
+          h('p', { style: { fontSize: '0.7rem', color: '#666', marginTop: '4px', padding: '0 8px' } },
+            '点击外部自动关闭')
+        )
+      ),
+      h('div', { ref: hoverRef,
+        style: {
+          padding: '12px', textAlign: 'center', borderRadius: '6px',
+          background: isHovering ? '#a78bfa' : '#1e1e2e',
+          color:      isHovering ? '#1e1e2e' : '#a78bfa',
+          transition: 'all 0.2s',
+        }
+      }, isHovering ? '🎉 悬停中！' : '把鼠标放上来')
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 34：useLocalStorage —— 持久化状态
+  // ─────────────────────────────────────────────────────────────
+  function LocalStorageDemo() {
+    const [theme, setTheme] = useLocalStorage('mini-react-demo-theme', 'dark')
+    const [color, setColor] = useLocalStorage('mini-react-demo-color', '#6366f1')
+
+    return h('div', null,
+      h('p', { style: { fontSize: '0.8rem', color: '#888', marginBottom: '8px' } },
+        '刷新页面后状态仍保留（写入 localStorage）'),
+      h('div', { style: {
+        padding: '12px', borderRadius: '6px',
+        background: theme === 'dark' ? '#0a0a14' : '#f1f5f9',
+        color:      theme === 'dark' ? '#e8e8f0' : '#1e293b',
+        marginBottom: '10px', textAlign: 'center', borderLeft: `4px solid ${color}`,
+      }}, `主题：${theme}　·　主色：${color}`),
+      h('div', { style: { display: 'flex', gap: '4px', marginBottom: '6px' } },
+        h('button', { onClick: () => setTheme(t => t === 'dark' ? 'light' : 'dark') }, '切换主题'),
+        ['#6366f1', '#06b6d4', '#10b981', '#f59e0b', '#ef4444'].map(c =>
+          h('button', { key: c, onClick: () => setColor(c),
+            style: { background: c, width: '20px', height: '20px',
+              borderRadius: '50%', padding: 0, margin: '2px',
+              border: c === color ? '2px solid white' : 'none' }}, '')
+        )
+      )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 35：useCopyToClipboard
+  // ─────────────────────────────────────────────────────────────
+  function CopyDemo() {
+    const [copied, copy] = useCopyToClipboard()
+    const SAMPLES = [
+      'npm install mini-react',
+      'window.MiniReact.useState(0)',
+      'createStore(reducer, initialState)',
+    ]
+    return h('div', null,
+      h('p', { style: { fontSize: '0.8rem', color: '#888', marginBottom: '8px' } },
+        '点击代码片段复制到剪贴板'),
+      SAMPLES.map(s =>
+        h('div', { key: s,
+          onClick: () => copy(s),
+          style: {
+            background: '#0a0a14', color: copied === s ? '#10b981' : '#6ee7f7',
+            padding: '8px 10px', borderRadius: '6px', marginBottom: '4px',
+            fontFamily: 'monospace', fontSize: '0.8rem', cursor: 'pointer',
+            border: copied === s ? '1px solid #10b981' : '1px solid #2a2a3a',
+            transition: 'all 0.2s',
+          }
+        }, copied === s ? `✓ 已复制：${s}` : s)
+      ),
+      copied && h('p', { style: { fontSize: '0.75rem', color: '#10b981', marginTop: '6px' } },
+        `（"${copied}" 已写入剪贴板）`)
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 36：useThrottle / useUpdateEffect / useForceUpdate
+  // ─────────────────────────────────────────────────────────────
+  function MiscHooksDemo() {
+    const [pos, setPos] = useState({ x: 0, y: 0 })
+    // 节流：每 100ms 最多更新一次
+    const throttled = useThrottle(pos, 100)
+    const [bigValue, setBig] = useState(1)
+    const [updateLog, setLog] = useState([])
+    // 跳过首次的 effect（仅在更新时打印）
+    useUpdateEffect(() => {
+      setLog(prev => [`bigValue 更新为 ${bigValue}`, ...prev.slice(0, 2)])
+    }, [bigValue])
+    const force = useForceUpdate()
+    const renderCount = useRef(0)
+    renderCount.current++
+
+    return h('div', null,
+      h('div', {
+        onMouseMove: e => {
+          const rect = e.currentTarget.getBoundingClientRect()
+          setPos({ x: Math.round(e.clientX - rect.left), y: Math.round(e.clientY - rect.top) })
+        },
+        style: {
+          height: '60px', background: '#0a0a14', borderRadius: '6px',
+          padding: '8px', fontSize: '0.78rem', color: '#94a3b8',
+          marginBottom: '8px', cursor: 'crosshair',
+        }
+      },
+        h('p', null, `当前坐标：(${pos.x}, ${pos.y})`),
+        h('p', { style: { color: '#6ee7f7' } },
+          `节流坐标 (100ms)：(${throttled.x}, ${throttled.y})`),
+      ),
+      h('div', { style: { marginBottom: '8px' } },
+        h('button', { onClick: () => setBig(v => v * 2) }, `bigValue × 2 (=${bigValue})`),
+        h('button', { onClick: force, className: 'ghost' },
+          `forceUpdate（已渲染 ${renderCount.current} 次）`),
+      ),
+      h('div', { className: 'log' },
+        updateLog.length === 0
+          ? h('p', null, '修改 bigValue 触发 useUpdateEffect…')
+          : updateLog.map((l, i) => h('p', { key: i }, l))
+      )
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Demo 37：useMediaQuery —— 响应式断点
+  // ─────────────────────────────────────────────────────────────
+  function MediaQueryDemo() {
+    const isMobile = useMediaQuery('(max-width: 640px)')
+    const isWide   = useMediaQuery('(min-width: 1024px)')
+    const prefersDark = useMediaQuery('(prefers-color-scheme: dark)')
+
+    return h('div', null,
+      h('p', { style: { fontSize: '0.8rem', color: '#888', marginBottom: '8px' } },
+        '调整窗口尺寸可以看到状态变化'),
+      h('ul', { style: { fontSize: '0.85rem', color: '#94a3b8', listStyle: 'none' } },
+        h('li', { style: { color: isMobile ? '#10b981' : '#555' } },
+          `${isMobile ? '✓' : '✗'} 移动端 (≤ 640px)`),
+        h('li', { style: { color: isWide ? '#10b981' : '#555' } },
+          `${isWide ? '✓' : '✗'} 宽屏 (≥ 1024px)`),
+        h('li', { style: { color: prefersDark ? '#10b981' : '#555' } },
+          `${prefersDark ? '✓' : '✗'} 系统偏好深色`),
+      )
+    )
+  }
+
   // ─────────────────────────────────────────────────────────────
   // 根组件：把所有 Demo 组合在一起
   // ─────────────────────────────────────────────────────────────
@@ -1164,6 +1753,21 @@
       { title: 'Demo 20：PureComponent + 生命周期', desc: '浅比较优化 + componentDidMount/Update/Unmount', component: ClassComponentDemo   },
       { title: 'Demo 21：useInsertionEffect', desc: 'CSS-in-JS 样式注入（最早副作用阶段）',               component: InsertionEffectDemo  },
       { title: 'Demo 22：useDeferredValue',   desc: '派生值延迟更新，高频输入不被昂贵子树阻塞',           component: DeferredValueDemo    },
+      { title: 'Demo 23：use() + Suspense',   desc: 'React 19 风格：渲染中读取 Promise',                   component: UseHookDemo          },
+      { title: 'Demo 24：useOptimistic',      desc: '乐观 UI：消息立刻显示，落库后转正',                   component: OptimisticDemo       },
+      { title: 'Demo 25：useActionState',     desc: '表单 action：自带 isPending 与异步 reducer',          component: ActionStateDemo      },
+      { title: 'Demo 26：Profiler',           desc: '测量子树渲染耗时，输出 mount/update 阶段',            component: ProfilerDemo         },
+      { title: 'Demo 27：mergeRefs',          desc: '把多个 ref 合并到同一 DOM 节点',                       component: MergeRefsDemo        },
+      { title: 'Demo 28：PropTypes',          desc: '运行时 prop 类型校验（错误见 console）',               component: PropTypesDemo        },
+      { title: 'Demo 29：createStore',        desc: 'Redux 风格：reducer + middleware（logger 自动打印）',  component: ReduxStyleDemo       },
+      { title: 'Demo 30：renderToString',     desc: 'SSR：把组件树序列化为 HTML 字符串',                    component: SSRDemo              },
+      { title: 'Demo 31：自定义 hooks',       desc: 'useToggle / useDebounce / usePrevious / useCounter',   component: CustomHooksDemo      },
+      { title: 'Demo 32：useInterval / useKeyPress', desc: '声明式 setInterval、键盘监听、窗口尺寸',         component: HooksObservabilityDemo },
+      { title: 'Demo 33：useOnClickOutside / useHover', desc: '点击外部关闭、悬停检测',                        component: ClickOutsideHoverDemo  },
+      { title: 'Demo 34：useLocalStorage',    desc: '与 localStorage 双向同步，刷新后状态保留',             component: LocalStorageDemo     },
+      { title: 'Demo 35：useCopyToClipboard', desc: '一键复制到剪贴板',                                     component: CopyDemo             },
+      { title: 'Demo 36：useThrottle / useUpdateEffect / useForceUpdate', desc: '节流坐标 / 跳过首次 effect / 强制重渲染', component: MiscHooksDemo },
+      { title: 'Demo 37：useMediaQuery',      desc: '响应式断点检测，跟随窗口变化',                          component: MediaQueryDemo       },
     ]
 
     return h('div', { className: 'grid' },
