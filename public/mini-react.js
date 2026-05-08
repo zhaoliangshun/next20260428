@@ -32,9 +32,21 @@
   // ─────────────────────────────────────────────────────────────
 
   /**
-   * createElement —— JSX 编译目标。
-   * <div className="a">hi</div>  →  createElement('div', {className:'a'}, 'hi')
-   * children 展平 + 过滤 null/undefined/boolean + 字符串包装为 TEXT_ELEMENT。
+   * createElement —— JSX 编译目标，构造 React Element 描述对象。
+   *
+   * Babel 把 JSX 转换为本函数调用：
+   *   JSX：    <div className="a">hi</div>
+   *   编译后： createElement('div', { className: 'a' }, 'hi')
+   *   产出：   { type: 'div', props: { className: 'a', children: [{type:'TEXT_ELEMENT',...}] } }
+   *
+   * children 处理流水线：
+   *   1. flat(Infinity)：把嵌套数组展平为一维（[a, [b, c], [d]] → [a, b, c, d]）
+   *   2. 过滤 null/undefined/boolean：支持 cond && <Comp/> 这种条件渲染
+   *      （注意：0 / '' 不会被过滤，会作为文本节点显示，这与真实 React 一致）
+   *   3. 非对象（字符串/数字）包装成 TEXT_ELEMENT，方便 reconciler 统一处理
+   *
+   * ⚠️ 注意：本实现把 key/ref 与其它 props 一同放在 props 上（简化版），
+   *    与 React 把 key/ref 提到 element 顶层略有不同，但功能等价。
    */
   function createElement(type, props, ...children) {
     return {
@@ -71,9 +83,26 @@
     return { type: element.type, props }
   }
 
-  /** isValidElement —— 判断是否为合法的 React Element。 */
+  /**
+   * isValidElement —— 判断是否为合法的 React Element。
+   *
+   * 合法 element 必须满足：
+   *   1. 是非空对象
+   *   2. 有 type 字段（string / function / Symbol-like 都算）
+   *   3. 有 props 字段（对象，可能为空对象）
+   *   4. type 不是 undefined（避免 createElement(undefined, ...) 这种错误）
+   *
+   * 修复：原版仅检查 'type' in obj，对 type=undefined 的非法 element 也返回 true。
+   */
   function isValidElement(obj) {
-    return typeof obj === 'object' && obj !== null && 'type' in obj && 'props' in obj
+    return (
+      typeof obj === 'object' &&
+      obj !== null &&
+      'type' in obj &&
+      obj.type !== undefined &&
+      'props' in obj &&
+      typeof obj.props === 'object'
+    )
   }
 
   /** Fragment —— 不产生 DOM 的多根节点占位符。 */
@@ -86,23 +115,38 @@
   // § 2  全局调度状态
   // ─────────────────────────────────────────────────────────────
 
-  let nextUnitOfWork       = null   // render 阶段游标
-  let currentRoot          = null   // 已提交的 current 树
-  let wipRoot              = null   // 正在构建的 wip 树
-  let deletions            = []     // 本轮需删除的 Fiber
-  let pendingRerender      = false  // commit 前/中 setState 的延迟标记
-  let isCommitting         = false  // mutation pass 期间
-  let workLoopScheduled    = false
-  let pendingPassiveRoots  = []
-  let passiveFlushScheduled = false
+  // ── 双缓冲 Fiber 树 ─────────────────────────────────────────
+  // current 树（已提交，对应当前 DOM）  ↔  wip 树（正在构建）
+  // 提交完成后 wip 替换 current；下次更新基于新的 current 派生新的 wip。
+  let nextUnitOfWork       = null   // 工作循环游标，下一个要处理的 Fiber
+  let currentRoot          = null   // 已提交的 current 树根
+  let wipRoot              = null   // 正在构建的 wip 树根
+  let deletions            = []     // 本轮需要从 DOM 中删除的 Fiber 列表
+  let pendingRerender      = false  // commit 期间收到的 setState：等 commit 结束后再触发一轮
+  let isCommitting         = false  // mutation pass 期间为 true，用于检测重入
+  let workLoopScheduled    = false  // workLoop 是否已通过 requestIdle 排队（避免重复调度）
+  let pendingPassiveRoots  = []     // 等待执行 useEffect 的根 Fiber 列表
+  let passiveFlushScheduled = false // setTimeout 是否已派发 passive 刷新
   let needsRerenderAfterCommit = false  // Suspense 首次挂起后触发回显 fallback
-  let pendingErrorBoundary      = null  // 渲染期捕获的 Error Boundary fiber
-  let pendingErrorBoundaryError = null  // 与之对应的错误对象
+  // 渲染期捕获的 Error Boundary 队列：[{boundary, error}, ...]
+  // 修复：原版用单变量保存，同一轮 render 中多个独立 Boundary 同时崩溃时只保留最后一个，
+  // 其它边界既不会调用 componentDidCatch 也不会展示 fallback UI。
+  const pendingErrorBoundaries = []
 
+  // ── Hooks 渲染上下文 ───────────────────────────────────────
+  // 每次进入函数组件 render 之前，updateFunctionComponent 会重置这两个变量；
+  // useState/useEffect 等 hook 调用时按 hookIndex 顺序读写 wipFiber.hooks。
+  // 这就是为什么 hook 必须按固定顺序调用、不能放进条件分支的原因。
   let wipFiber  = null
   let hookIndex = 0
-  let idCounter = 0
+  let idCounter = 0  // useId 的全局自增计数器，组件实例间各自持有自己的快照
 
+  /**
+   * 时间切片调度器：
+   *   - 浏览器原生 requestIdleCallback：在主线程空闲时执行，不阻塞用户交互
+   *   - setTimeout 兜底（Safari 等不支持 RIC 的环境）：用 1ms 延迟模拟空闲触发
+   *   - timeout: 16 表示哪怕一直忙，也最多等一帧（≈16ms）就强制执行一次
+   */
   const requestIdle = window.requestIdleCallback
     ? cb => window.requestIdleCallback(cb, { timeout: 16 })
     : cb => setTimeout(() => cb({ timeRemaining: () => 50 }), 1)
@@ -316,10 +360,26 @@
   // ─────────────────────────────────────────────────────────────
 
   /**
-   * reconcileChildren —— O(n) Diff：key Map + 无 key 顺序匹配。
+   * reconcileChildren —— O(n) Diff 算法：把新 elements 与旧 Fiber 链表对比，
+   * 标记 PLACEMENT / UPDATE / DELETION 三类 effectTag，构建新的子 Fiber 链表。
    *
-   * Bug fix（v2）：原版 `index === 0` 当首位元素为 null 时会丢失后续 Fiber。
-   * 改为 `!prevSibling` 检测"尚未链接第一个有效 Fiber"。
+   * 数据结构：
+   *   keyedOld   Map<key, fiber>   — 有 key 的旧 fiber 按 key 索引
+   *   unkeyedOld fiber[]            — 无 key 的旧 fiber 按出现顺序排列
+   *   usedOld    Set<fiber>         — 已被新 element 复用的旧 fiber，剩余的将被删除
+   *
+   * 匹配规则：
+   *   有 key   → 按 key 在 keyedOld 中查找（即便位置变了也能复用，触发 reorder）
+   *   无 key   → 按 unkeyedIdx 顺序匹配下一个未被使用的旧 fiber
+   *
+   * 复用条件：oldMatch.type === element.type
+   *   匹配 → 标记 UPDATE，复用 dom，alternate 指向旧 fiber
+   *   不匹配但有元素 → 标记 PLACEMENT，新建 fiber
+   *   不匹配但有旧 → 标记 DELETION，旧 fiber 入 deletions
+   *
+   * Bug fix（v2）：原版 `index === 0` 在首位元素为 null 时（被外层 if 跳过）
+   * 仍然 truthy，导致第二个有效元素错误成为 child；改为 `!prevSibling`
+   * 检测"尚未链接第一个有效 Fiber"，准确处理 [null, <A/>, <B/>] 这类列表。
    */
   function reconcileChildren(wipF, elements) {
     const keyedOld    = new Map()
@@ -384,9 +444,28 @@
 
   /**
    * commitRoot —— 不可中断的同步提交。
-   *   Phase 1 Mutation  —— DOM 插入 / 更新 / 删除
-   *   Phase 2 Layout    —— useLayoutEffect + componentDidMount/Update（同步）
-   *   Phase 3 Passive   —— useEffect（setTimeout 异步）
+   *
+   * 三阶段提交流水线（与真实 React 保持一致）：
+   *   ╔══════════════════════════════════════════════════════════╗
+   *   ║ Phase 1  Mutation  —— DOM 插入 / 更新 / 删除              ║
+   *   ║          • 先处理 deletions（防止 PLACEMENT 时父子顺序错  ║
+   *   ║            乱），再 DFS 处理新子树                         ║
+   *   ║          • normalizeHostChildren 修正 keyed reorder       ║
+   *   ╠══════════════════════════════════════════════════════════╣
+   *   ║ Phase 1.5 Insertion —— useInsertionEffect（DOM 插入后）  ║
+   *   ║          • CSS-in-JS 注入 <style>，发生在浏览器绘制前      ║
+   *   ╠══════════════════════════════════════════════════════════╣
+   *   ║ Phase 2  Layout    —— useLayoutEffect + cDM/cDU（同步）  ║
+   *   ║          • DOM 已就绪可以测量；本阶段 setState 会同步追刷  ║
+   *   ╠══════════════════════════════════════════════════════════╣
+   *   ║ Phase 3  Passive   —— useEffect（setTimeout 异步）       ║
+   *   ║          • 浏览器绘制之后才执行，不阻塞画面               ║
+   *   ╚══════════════════════════════════════════════════════════╝
+   *
+   * 收尾会处理三种"延后通知"：
+   *   • Suspense 挂起回声（needsRerenderAfterCommit）
+   *   • commit 期间的 setState（pendingRerender）
+   *   • Error Boundary 捕获队列（pendingErrorBoundaries）
    */
   function commitRoot() {
     const root = wipRoot
@@ -425,14 +504,14 @@
       pendingRerender = false
       scheduleRerender()
     }
-    // Error Boundary：commit 后通知边界组件（componentDidCatch），并重渲染展示错误 UI
-    if (pendingErrorBoundary) {
-      const boundary = pendingErrorBoundary
-      const error    = pendingErrorBoundaryError
-      pendingErrorBoundary      = null
-      pendingErrorBoundaryError = null
-      // componentDidCatch 接收 error 和 info（真实 React 传递组件堆栈，此处简化为空）
-      boundary.instance?.componentDidCatch?.(error, { componentStack: '' })
+    // Error Boundary：commit 后通知所有捕获到错误的边界组件（componentDidCatch），并重渲染展示错误 UI
+    // 注意：本轮 render 中可能有多个独立 Boundary 同时崩溃，需要全部通知
+    if (pendingErrorBoundaries.length > 0) {
+      const queue = pendingErrorBoundaries.splice(0)
+      queue.forEach(({ boundary, error }) => {
+        // componentDidCatch 接收 error 和 info（真实 React 传递组件堆栈，此处简化为空）
+        boundary.instance?.componentDidCatch?.(error, { componentStack: '' })
+      })
       scheduleRerender()
     }
   }
@@ -596,23 +675,92 @@
   const isProp  = k => k !== 'children' && k !== 'key' && k !== 'ref' && !isEvent(k)
   const isNew   = (p, n) => k => p[k] !== n[k]
   const isGone  = (_, n) => k => !(k in n)
+  // 事件别名：把 React 风格的事件名映射回 DOM 原生事件名（部分需要小写处理）
   const eventAliases = { doubleclick: 'dblclick' }
   const toEvt   = name => { const n = name.slice(2).toLowerCase(); return eventAliases[n] || n }
 
+  // 布尔属性：从 DOM 上"移除"它们时应当置为 false 而不是 ''（'' 会被 IDL 解释为不一致状态）
+  const BOOLEAN_PROPS = new Set([
+    'checked', 'disabled', 'readOnly', 'multiple', 'autoFocus',
+    'hidden', 'selected', 'controls', 'loop', 'muted', 'autoPlay', 'open',
+  ])
+  // 必须用 setAttribute 而不是 dom[k] 赋值的属性（DOM property 与 attribute 名不一致）
+  const ATTR_ONLY_PROPS = new Set(['htmlFor', 'class', 'for', 'tabIndex'])
+  // htmlFor → for；className 单独处理
+  const ATTR_NAME_MAP = { htmlFor: 'for' }
+
+  /**
+   * 设置 DOM 属性的统一入口：根据值类型走不同分支。
+   *   - 函数：忽略（事件已在另一分支处理）
+   *   - dangerouslySetInnerHTML：直接写 innerHTML
+   *   - 布尔属性：用 IDL 赋值（dom[k] = !!value）
+   *   - data-* / aria-*：用 setAttribute（DOM 没有这些 property）
+   *   - 其它：优先 IDL，fallback 到 setAttribute
+   */
+  function setDomProp(dom, key, value) {
+    if (key === 'dangerouslySetInnerHTML') {
+      dom.innerHTML = value?.__html ?? ''
+      return
+    }
+    if (key === 'className') { dom.className = value ?? ''; return }
+    if (key === 'style')     { return /* 由 updateStyle 处理 */ }
+    if (BOOLEAN_PROPS.has(key)) { dom[key] = !!value; return }
+    if (key.startsWith('data-') || key.startsWith('aria-')) {
+      if (value == null || value === false) dom.removeAttribute(key)
+      else dom.setAttribute(key, value === true ? '' : value)
+      return
+    }
+    if (ATTR_ONLY_PROPS.has(key)) {
+      const name = ATTR_NAME_MAP[key] || key
+      if (value == null || value === false) dom.removeAttribute(name)
+      else dom.setAttribute(name, value)
+      return
+    }
+    // value/checked 等受控属性：IDL 赋值能正确同步 input 状态
+    try { dom[key] = value }
+    catch { /* 某些属性只读，吞掉错误 */ }
+  }
+
+  /**
+   * 移除 DOM 属性：对布尔属性 / data-aria / 受控属性分别走不同路径。
+   * 修复：原版统一 dom[k] = ''，对 disabled/checked 等布尔属性会留下错误状态
+   * （'' 在某些浏览器中被 IDL 解释为 truthy）。
+   */
+  function unsetDomProp(dom, key, prevValue) {
+    if (key === 'style')     { updateStyle(dom, prevValue, null); return }
+    if (key === 'className') { dom.className = ''; return }
+    if (BOOLEAN_PROPS.has(key)) { dom[key] = false; return }
+    if (key.startsWith('data-') || key.startsWith('aria-') || ATTR_ONLY_PROPS.has(key)) {
+      const name = ATTR_NAME_MAP[key] || key
+      dom.removeAttribute(name); return
+    }
+    try { dom[key] = '' } catch { /* 忽略只读属性 */ }
+  }
+
   function updateDom(dom, prev, next) {
+    // ── ref 解绑：旧 ref 与新 ref 不同时，先把旧 ref 置 null ──────
     if (prev.ref !== next.ref) setRef(prev.ref, null)
+
+    // ── 事件：移除已删除/已变更的事件 ─────────────────────────────
     Object.keys(prev).filter(isEvent).filter(k => !(k in next) || isNew(prev, next)(k))
       .forEach(k => dom.removeEventListener(toEvt(k), prev[k]))
+
+    // ── 普通属性：清理已不在 next 中的属性 ────────────────────────
     Object.keys(prev).filter(isProp).filter(isGone(prev, next))
-      .forEach(k => { if (k === 'style') updateStyle(dom, prev.style, null); else dom[k] = '' })
+      .forEach(k => unsetDomProp(dom, k, prev[k]))
+
+    // ── 普通属性：写入新值或变更值 ────────────────────────────────
     Object.keys(next).filter(isProp).filter(isNew(prev, next))
       .forEach(k => {
         if (k === 'style') updateStyle(dom, prev.style, next.style)
-        else if (k === 'className') dom.className = next[k]
-        else dom[k] = next[k]
+        else setDomProp(dom, k, next[k])
       })
+
+    // ── 事件：添加新增/已变更的事件 ───────────────────────────────
     Object.keys(next).filter(isEvent).filter(isNew(prev, next))
       .forEach(k => dom.addEventListener(toEvt(k), next[k]))
+
+    // ── ref 绑定：把新 ref 指向当前 DOM ───────────────────────────
     if (prev.ref !== next.ref) setRef(next.ref, dom)
   }
 
@@ -642,8 +790,21 @@
   // ─────────────────────────────────────────────────────────────
 
   /**
-   * useReducer —— 状态管理核心。
-   * queue.splice(0) 消费并清空队列（关键：防止重复 reduce 同一批 action）。
+   * useReducer —— 所有状态 hook 的基础（useState 是它的语法糖）。
+   *
+   * 状态更新流程：
+   *   1. dispatch(action) 把 action 推入 hook.queue（不立刻渲染，只标记需要重渲染）
+   *   2. scheduleRerender 创建新 wipRoot 触发工作循环
+   *   3. 重新执行函数组件 → useReducer 读到 alternate.hooks[i] 的 queue
+   *   4. queue.splice(0) 消费并清空所有 action，依次 reduce 出新 state
+   *      ⚠️ splice(0) 是关键：清空原数组防止下次再次 reduce 同一批 action 造成累计
+   *   5. 返回最新 state 给组件
+   *
+   * 注意闭包陷阱：dispatch 函数引用稳定（指向同一个 hook 对象），但每次渲染
+   * hook 都是新对象，靠 hook.queue（与 alternate 共享）传递 action。
+   *
+   * 第三参数 init 用于惰性初始化：useReducer(reducer, props, p => createInitialState(p))
+   * init 仅在首次渲染（无 alternate）时被调用。
    */
   function useReducer(reducer, initialState, init) {
     const oldHook = wipFiber.alternate?.hooks?.[hookIndex]
@@ -670,8 +831,20 @@
   }
 
   /**
-   * useEffect —— 异步副作用（绘制后 setTimeout）。
-   * deps 语义：undefined=每次，[]=仅 mount，[a,b]=依赖变化时。
+   * useEffect —— 异步副作用（绘制后 setTimeout 异步执行）。
+   *
+   * 用途：网络请求、订阅、日志埋点等不阻塞首帧的副作用。
+   *
+   * deps 语义：
+   *   undefined  → 每次渲染后都执行（一般避免，会过度触发）
+   *   []         → 仅 mount/unmount 时执行一次（订阅类经典写法）
+   *   [a, b]     → 任一依赖变化时重新执行（cleanup 在 next callback 之前调用）
+   *
+   * 状态机：
+   *   首次：       callback ≠ null，cleanup = null  → 执行 callback，存 cleanup
+   *   deps 变化：  执行旧 cleanup → 再执行 callback → 存新 cleanup
+   *   deps 不变：  callback = null（跳过执行），cleanup 保留供卸载时调用
+   *   卸载：       runUnmountEffects 调用 cleanup
    */
   function useEffect(callback, deps) {
     const old  = wipFiber.alternate?.hooks?.[hookIndex]
@@ -734,14 +907,25 @@
 
   /**
    * useImperativeHandle —— 配合 forwardRef，向父组件暴露自定义 ref 对象。
-   * 在 layout 阶段同步设置 ref，cleanup 时清空。
+   *
+   * 设计要点：
+   *   1. 在 layout 阶段同步设置 ref，确保父组件 componentDidMount/useLayoutEffect
+   *      可以立即读取到 ref.current（不晚于 DOM 就绪时刻）。
+   *   2. cleanup 时把 ref 置为 null，避免父组件持有"已卸载组件"的句柄导致内存泄漏。
+   *   3. ref 本身参与依赖数组（修复：原版仅以用户 deps 作为依赖，
+   *      ref 切换时旧 ref 不会被清空，新 ref 也不会被赋值，导致 ref 失同步）。
+   *
+   * 用法：
+   *   useImperativeHandle(ref, () => ({ focus, reset }), [deps...])
    */
   function useImperativeHandle(ref, createHandle, deps) {
+    // 把 ref 注入到 deps 中：ref 变化时强制重新执行 effect
+    const finalDeps = deps == null ? undefined : [ref, ...deps]
     useLayoutEffect(() => {
       if (!ref) return
       setRef(ref, createHandle())
       return () => setRef(ref, null)
-    }, deps)
+    }, finalDeps)
   }
 
   /**
@@ -756,11 +940,25 @@
 
   /**
    * useTransition —— 将状态更新标记为"可中断的低优先级过渡"。
-   * 简化实现：callback 在 setTimeout 中执行，isPending 在此期间为 true。
-   * 真实 React 18 用 Scheduler 实现真正的并发优先级。
+   *
+   * 返回 [isPending, startTransition]：
+   *   - isPending：过渡期间为 true，可用于显示 loading 指示器
+   *   - startTransition：把状态更新包在它里面，标记为低优先级
+   *
+   * 典型场景：搜索框输入时，列表过滤计算昂贵但不应阻塞输入光标。
+   *   const [isPending, startTransition] = useTransition()
+   *   const onChange = e => {
+   *     setQuery(e.target.value)              // 高优先级：立即响应
+   *     startTransition(() => setList(...))   // 低优先级：让出主线程
+   *   }
+   *
+   * ⚠️ 简化实现：callback 在 setTimeout 中执行，让浏览器有机会先处理高优先级
+   *    更新（如输入框值同步）。真实 React 18 通过 Scheduler 优先级通道实现
+   *    真正的可中断渲染（"时间片让步"），此处仅是宏任务级的近似。
    */
   function useTransition() {
     const [isPending, setIsPending] = useState(false)
+    // start 引用稳定，即使 isPending 变化也不重建（避免子组件 useEffect 误触发）
     const start = useCallback(callback => {
       setIsPending(true)
       setTimeout(() => { callback(); setIsPending(false) }, 0)
@@ -770,10 +968,28 @@
 
   /**
    * useDeferredValue —— 返回一个"延迟版本"的值，在高优先级更新完成后才更新。
-   * 简化实现：直接返回最新值（无真正的延迟）。
-   * 真实 React 18 使用并发调度将低优先级更新推迟到高优先级渲染之后。
+   *
+   * 工作原理（简化版）：
+   *   1. 渲染时返回缓存的旧值
+   *   2. useEffect 在 commit + paint 后异步把 deferred 更新为最新值
+   *   3. 触发二次渲染，此时返回新值
+   * 这样输入框等高频交互不会被昂贵子树阻塞，子树在浏览器空闲时才同步到最新值。
+   *
+   * ⚠️ 与 React 18 的差异：真实 React 用 Scheduler 优先级让出，此处用 setTimeout(0)
+   *    近似——足够演示场景但缺少真正的中断恢复语义。
+   *
+   * 修复：原版直接 return value 等于没用，与 useTransition 配合使用时无延迟效果。
    */
-  function useDeferredValue(value) { return value }
+  function useDeferredValue(value) {
+    const [deferred, setDeferred] = useState(value)
+    useEffect(() => {
+      if (Object.is(deferred, value)) return
+      // 微任务/宏任务延迟：让高优先级渲染先完成
+      const id = setTimeout(() => setDeferred(value), 0)
+      return () => clearTimeout(id)
+    }, [value])
+    return deferred
+  }
 
   /**
    * useSyncExternalStore —— 订阅外部数据源（Redux、Zustand 等状态管理库专用 hook）。
@@ -1012,15 +1228,26 @@
   /**
    * memo —— 跳过 props 未变化的函数组件渲染（浅比较）。
    *
-   * 自定义比较：memo(Component, (prev, next) => deepEqual(prev, next))
-   * ⚠️ 与 useContext 配合时，memo 可能阻止 context 变化触发的重渲染。
+   * 用法：
+   *   const Pure = memo(MyComp)                                  // 默认浅比较
+   *   const Pure = memo(MyComp, (prev, next) => prev.id === next.id)  // 自定义比较
+   *
+   * 实现：返回带 _isMemo 标记的包装函数，updateFunctionComponent 检测到
+   * 标记后在渲染前先做 alternate.props 与 props 的浅比较，相等则复用上次的
+   * memoizedElement（彻底跳过函数体执行 + 子树 diff）。
+   *
+   * ⚠️ 注意事项：
+   *   - 与 useContext 配合时，memo 不会拦截 context 变化触发的重渲染（消费者
+   *     仍然会订阅 context 更新），但会拦截父组件传下来的 props 引起的重渲染。
+   *   - 与 forwardRef 嵌套使用：memo(forwardRef(...)) 是合法且常见的写法，
+   *     本实现已正确处理（updateFunctionComponent 解 memo 后再判 forwardRef）。
    */
   function memo(component, compare) {
     function Memoized(props) { return component(props) }
     Memoized._isMemo     = true
     Memoized._type       = component
     Memoized._compare    = compare || shallowEqualProps
-    Memoized.displayName = `memo(${component.name || 'Component'})`
+    Memoized.displayName = `memo(${component.displayName || component.name || 'Component'})`
     return Memoized
   }
 
@@ -1059,10 +1286,26 @@
 
   /**
    * flushSync —— 同步立即提交 callback 中触发的所有状态更新。
-   * 场景：添加列表项后立刻滚动到底部。
-   * ⚠️ 不能嵌套使用；会阻塞浏览器绘制。
+   *
+   * 典型场景：
+   *   - 添加列表项后立刻滚动到底部（DOM 必须先就绪）
+   *   - 测试中需要在断言前确保 DOM 已更新
+   *   - 与第三方库（如 jQuery 插件）交互前同步刷新
+   *
+   * 实现：先执行回调（其中的 setState 会进入 wipRoot 队列），
+   *      再 flushSyncWork 把所有未完成的工作循环跑到底并提交。
+   *
+   * ⚠️ 嵌套调用：内部加 _isFlushingSync 标记，嵌套时只执行回调不再触发 flushSyncWork
+   *    （外层 flushSync 一次性收尾即可，避免重复提交触发 commit 重入）。
+   * ⚠️ 会阻塞浏览器绘制：组件树过大时谨慎使用。
    */
-  function flushSync(callback) { callback(); flushSyncWork() }
+  let _isFlushingSync = false
+  function flushSync(callback) {
+    if (_isFlushingSync) { callback(); return }
+    _isFlushingSync = true
+    try { callback(); flushSyncWork() }
+    finally { _isFlushingSync = false }
+  }
 
   /**
    * startTransition —— 将 callback 中的更新标记为低优先级过渡（简化版）。
@@ -1083,32 +1326,56 @@
    * act() 强制同步完成所有工作，使测试断言能立即看到最新 DOM。
    *
    * 用法：
+   *   // 同步场景：
    *   act(() => { fireEvent.click(button) })
    *   expect(container.textContent).toBe('1')  // DOM 已同步更新
    *
-   *   // 异步场景（React.lazy / useEffect 内的 setState）：
+   *   // 异步场景（React.lazy / 异步 useEffect / fetch）：
    *   await act(async () => { await someAsyncOp() })
    *
    * 执行顺序：
    *   1. 执行 callback（触发 setState / dispatch）
    *   2. 同步提交所有排队的渲染（flushSyncWork）
-   *   3. 同步清空所有 passive effects（useEffect）
-   *   4. 若 effects 触发了新的 setState，再次刷新（确保完全稳定）
+   *   3. 同步清空所有 passive effects（useEffect，跳过 setTimeout 等待）
+   *   4. 若 effects 触发了新的 setState，反复刷新直到稳定（最多 50 轮防死循环）
+   *
+   * 修复：原版仅同步执行 callback，无法处理 async 回调（callback 返回 Promise 时
+   * 在 await 之前就提交，导致 Promise 内部的 setState 被遗漏）。新版若检测到 thenable
+   * 会返回 Promise，等待解决后再走刷新流程。
    */
+  function flushUntilStable() {
+    let safety = 50
+    while (safety-- > 0) {
+      flushSyncWork()
+      passiveFlushScheduled = false
+      const roots = pendingPassiveRoots.splice(0)
+      if (!roots.length && !nextUnitOfWork && !wipRoot) break
+      roots.forEach(flushPassiveEffects)
+    }
+  }
   function act(callback) {
-    callback()
-    flushSyncWork()
-    // 同步清空 useEffect（测试中不等待 setTimeout）
-    passiveFlushScheduled = false
-    pendingPassiveRoots.splice(0).forEach(flushPassiveEffects)
-    // effects 可能触发了新的 setState，再刷新一次
-    flushSyncWork()
+    const result = callback()
+    // 异步回调：返回 Promise 让调用方 await
+    if (result && typeof result.then === 'function') {
+      return Promise.resolve(result).then(() => { flushUntilStable() })
+    }
+    flushUntilStable()
   }
 
   // ─────────────────────────────────────────────────────────────
   // § 15  内部工具函数
   // ─────────────────────────────────────────────────────────────
 
+  /**
+   * scheduleRerender —— 触发一次根级重渲染。
+   *
+   * 关键判断：
+   *   - currentRoot 为 null → 还没首次提交，setState 推迟到首次 commit 后再处理
+   *   - isCommitting → 正在 mutation pass 中（layout effect 之前），
+   *     此时若立刻替换 wipRoot 会破坏正在进行的 commit；推迟到 commit 末尾统一处理
+   *
+   * 否则：构造新 wipRoot 复用 currentRoot 的 dom 与 props，从根开始 diff。
+   */
   function scheduleRerender() {
     if (!currentRoot || isCommitting) { pendingRerender = true; return }
     wipRoot        = { dom: currentRoot.dom, props: currentRoot.props, alternate: currentRoot }
@@ -1117,11 +1384,20 @@
     scheduleWorkLoop()
   }
 
+  /**
+   * flushSyncWork —— 同步把当前所有未完成的工作做完并提交。
+   * 区别于 workLoop：不让出主线程，连续运行直到 nextUnitOfWork 为空。
+   * 用于 flushSync / act / 测试等需要立即看到 DOM 结果的场景。
+   */
   function flushSyncWork() {
     while (nextUnitOfWork) nextUnitOfWork = performUnitOfWork(nextUnitOfWork)
     if (wipRoot) commitRoot()
   }
 
+  /**
+   * scheduleWorkLoop —— 把 workLoop 排到下一个空闲帧。
+   * 用 workLoopScheduled 标志去重，避免一帧内重复排队浪费资源。
+   */
   function scheduleWorkLoop() {
     if (workLoopScheduled) return
     workLoopScheduled = true
@@ -1192,8 +1468,8 @@
           if (errorState) inst.state = { ...inst.state, ...errorState }
         }
         // 记录待处理的 boundary，在 commitRoot 末尾触发 componentDidCatch + 重渲染
-        pendingErrorBoundary      = boundary
-        pendingErrorBoundaryError = error
+        // 同一轮 render 可能有多个 Boundary 命中，全部入队后统一处理
+        pendingErrorBoundaries.push({ boundary, error })
         return true
       }
       boundary = boundary.return
@@ -1209,11 +1485,24 @@
 
   /**
    * Children —— 安全操作 children prop 的工具集。
-   * 统一展平并过滤 null/undefined，提供稳定的遍历接口。
+   * 统一展平并过滤 null/undefined/boolean，提供稳定的遍历接口。
+   *
+   * 与 React 的对齐：
+   *   - toArray 会为没有 key 的元素分配位置 key（'.0', '.1' ...），
+   *     方便 map 后再次作为子节点时不会触发"missing key"警告。
+   *   - 过滤掉 boolean 与 null/undefined（条件渲染产物）。
    */
   const Children = {
     toArray(children) {
-      return [children].flat(Infinity).filter(c => c !== null && c !== undefined)
+      const flat = [children].flat(Infinity).filter(
+        c => c !== null && c !== undefined && typeof c !== 'boolean'
+      )
+      // 为缺失 key 的元素分配位置 key（不修改原对象）
+      return flat.map((c, i) => {
+        if (!isValidElement(c)) return c
+        if (c.props?.key != null) return c
+        return { ...c, props: { ...c.props, key: `.${i}` } }
+      })
     },
     map(children, fn)     { return Children.toArray(children).map(fn) },
     forEach(children, fn) { Children.toArray(children).forEach(fn) },

@@ -185,7 +185,7 @@
 </head>
 <body>
   <h1>Mini React</h1>
-  <p class="subtitle">~500 行代码实现 React 核心 · 架构与真实 React 保持一致</p>
+  <p class="subtitle">~1300 行代码实现 React 核心 · 架构与真实 React 保持一致</p>
 
   <div id="root"></div>
 
@@ -198,7 +198,7 @@
     useState, useReducer, useEffect, useLayoutEffect, useInsertionEffect,
     useRef, useMemo, useCallback, useId,
     useContext, createContext, memo, createRef, Children,
-    forwardRef, useImperativeHandle, useTransition,
+    forwardRef, useImperativeHandle, useTransition, useDeferredValue,
     createPortal, lazy, Suspense,
     useSyncExternalStore,
     Component, PureComponent,
@@ -1093,6 +1093,51 @@
   }
 
   // ─────────────────────────────────────────────────────────────
+  // Demo 22：useDeferredValue —— 延迟更新昂贵子树
+  // ─────────────────────────────────────────────────────────────
+  // 高频输入立即响应（input 受控值），昂贵列表在主线程空闲后再更新
+  // 与 useTransition 的区别：useTransition 包"更新动作"，useDeferredValue 包"派生值"
+  function HeavyList({ filter }) {
+    // 模拟昂贵渲染：每个项目都做一次 fib 计算
+    const items = useMemo(() => {
+      const fib = n => n <= 1 ? n : fib(n - 1) + fib(n - 2)
+      return Array.from({ length: 200 }, (_, i) => `${filter}-${i + 1}（${fib(20)}）`)
+    }, [filter])
+    return h('div', { style: { maxHeight: '120px', overflowY: 'auto' } },
+      items.slice(0, 30).map((s, i) =>
+        h('div', { key: i, style: { padding: '2px 0', fontSize: '0.78rem', color: '#94a3b8' } }, s)
+      )
+    )
+  }
+  const HeavyListMemo = memo(HeavyList)
+
+  function DeferredValueDemo() {
+    const [text, setText] = useState('')
+    // deferred 值在高优先级渲染后才更新到最新值，让输入光标先丝滑响应
+    const deferred = useDeferredValue(text)
+    const isStale  = text !== deferred
+
+    return h('div', null,
+      h('p', { style: { fontSize: '0.8rem', color: '#888', marginBottom: '6px' } },
+        '快速连续输入：输入框瞬时响应，下方列表延迟跟进'),
+      h('input', {
+        type: 'text',
+        value: text,
+        onInput: e => setText(e.target.value),
+        placeholder: '输入任意内容…',
+      }),
+      h('p', {
+        style: {
+          fontSize: '0.75rem',
+          color: isStale ? '#a78bfa' : '#555',
+          margin: '4px 0 8px',
+        }
+      }, isStale ? '⏳ 列表正在跟进…' : `当前显示：${deferred || '(空)'}`),
+      h(HeavyListMemo, { filter: deferred || 'item' })
+    )
+  }
+
+  // ─────────────────────────────────────────────────────────────
   // 根组件：把所有 Demo 组合在一起
   // ─────────────────────────────────────────────────────────────
   function App() {
@@ -1118,6 +1163,7 @@
       { title: 'Demo 19：Suspense + lazy',    desc: '懒加载组件，加载期间展示 fallback',                   component: SuspenseDemo         },
       { title: 'Demo 20：PureComponent + 生命周期', desc: '浅比较优化 + componentDidMount/Update/Unmount', component: ClassComponentDemo   },
       { title: 'Demo 21：useInsertionEffect', desc: 'CSS-in-JS 样式注入（最早副作用阶段）',               component: InsertionEffectDemo  },
+      { title: 'Demo 22：useDeferredValue',   desc: '派生值延迟更新，高频输入不被昂贵子树阻塞',           component: DeferredValueDemo    },
     ]
 
     return h('div', { className: 'grid' },
