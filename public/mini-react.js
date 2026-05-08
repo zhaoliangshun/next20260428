@@ -73,11 +73,13 @@
       .flat(Infinity)
       .filter(c => c !== null && c !== undefined && typeof c !== 'boolean')
       .map(c => (typeof c === 'object' ? c : createTextElement(c)))
-    return { type, key, ref, props }
+    // $$typeof 标记：与 React 完全一致，用于防 JSON 注入伪造与 DevTools 识别
+    return { $$typeof: REACT_ELEMENT_TYPE, type, key, ref, props }
   }
 
   function createTextElement(text) {
     return {
+      $$typeof: REACT_ELEMENT_TYPE,
       type: 'TEXT_ELEMENT',
       key: null,
       ref: null,
@@ -115,36 +117,50 @@
         .filter(c => c !== null && c !== undefined && typeof c !== 'boolean')
         .map(c => (typeof c === 'object' ? c : createTextElement(c)))
     }
-    return { type: element.type, key, ref, props }
+    return { $$typeof: REACT_ELEMENT_TYPE, type: element.type, key, ref, props }
   }
 
   /**
    * isValidElement —— 判断是否为合法的 React Element。
    *
-   * 合法 element 必须满足：
-   *   1. 是非空对象
-   *   2. 有 type 字段（string / function / Symbol-like 都算）
-   *   3. 有 props 字段（对象，可能为空对象）
-   *   4. type 不是 undefined（避免 createElement(undefined, ...) 这种错误）
+   * 与 React 完全一致：唯一可靠的判定条件是 $$typeof === REACT_ELEMENT_TYPE。
+   * 这一点至关重要——
+   *   - 攻击者无法通过 JSON.parse 构造合法 element（Symbol 不可序列化）
+   *   - 不会把意外的对象字面量误判成 element
    *
-   * 修复：原版仅检查 'type' in obj，对 type=undefined 的非法 element 也返回 true。
+   * 因为 $$typeof 是 Symbol.for 共享的全局符号，多个 mini-react 实例
+   * 之间也能正确互识。
    */
   function isValidElement(obj) {
     return (
       typeof obj === 'object' &&
       obj !== null &&
-      'type' in obj &&
-      obj.type !== undefined &&
-      'props' in obj &&
-      typeof obj.props === 'object'
+      obj.$$typeof === REACT_ELEMENT_TYPE
     )
   }
 
-  /** Fragment —— 不产生 DOM 的多根节点占位符。 */
-  const Fragment = '__fragment__'
+  /**
+   * REACT_ELEMENT_TYPE —— 与真实 React 一致使用 Symbol.for('react.element') 标记元素。
+   *
+   * 作用：
+   *   1. 防止 JSON 注入攻击：用户提交的 JSON 反序列化后没有 Symbol，
+   *      isValidElement 能据此拦截"伪装的 element"（XSS 防护）。
+   *   2. 与 React DevTools / 第三方调试器互通——它们靠 $$typeof 识别元素。
+   *   3. 跨 frame / iframe 时可降级为 0xeac7（数字标记），但本 mini 实现仅支持单 frame。
+   *
+   * Symbol.for 用 registry 共享：多次调用返回相同 Symbol，
+   * 即使 mini-react 加载多次也保持同一个标记。
+   */
+  const REACT_ELEMENT_TYPE  = typeof Symbol === 'function' ? Symbol.for('react.element')      : 0xeac7
+  const REACT_FRAGMENT_TYPE = typeof Symbol === 'function' ? Symbol.for('react.fragment')     : 0xeacb
+  const REACT_PORTAL_TYPE   = typeof Symbol === 'function' ? Symbol.for('react.portal')       : 0xeaca
+  const REACT_STRICT_MODE   = typeof Symbol === 'function' ? Symbol.for('react.strict_mode')  : 0xeacc
+
+  /** Fragment —— 不产生 DOM 的多根节点占位符（与 React.Fragment 同 Symbol）。 */
+  const Fragment = REACT_FRAGMENT_TYPE
 
   /** PORTAL —— createPortal 生成的特殊 host 类型，dom 指向目标容器。 */
-  const PORTAL = '__portal__'
+  const PORTAL = REACT_PORTAL_TYPE
 
   // ─────────────────────────────────────────────────────────────
   // § 2  全局调度状态
@@ -325,7 +341,55 @@
     }
 
     fiber.memoizedElement = child
+    // ── hook 顺序检测（开发期）──────────────────────────────
+    // React 的硬规则：每次渲染必须按相同顺序调用相同数量的 hook。
+    // 若用户把 hook 放进 if/return-early 里，下次渲染就会乱序，
+    // 进而读到错误的 state 槽位。本检测对比新旧 hook 标志序列，发现不一致就警告。
+    checkHookOrder(fiber)
     reconcileChildren(fiber, normalizeRenderOutput(child))
+  }
+
+  /**
+   * checkHookOrder —— 对比 alternate 与当前 fiber 的 hook 标志序列。
+   *
+   * 标志规则：每个 hook 在 wipFiber.hooks 中以特殊布尔标志区分类型
+   * （_isEffect / _isLayoutEffect / _isInsertionEffect / _isContext / queue 等）。
+   * 我们把它们提炼成一个 short type code 数组，逐位对比。
+   */
+  function _hookTypeCode(h) {
+    if (!h) return '?'
+    if (h._isEffect)          return 'E'
+    if (h._isLayoutEffect)    return 'L'
+    if (h._isInsertionEffect) return 'I'
+    if (h._isContext)         return 'C'
+    if (h._isDebugValue)      return 'D'
+    if ('queue' in h)         return 'S'  // useState / useReducer
+    if ('value' in h && 'deps' in h) return 'M'  // useMemo / useRef / useCallback / useId
+    return '?'
+  }
+  function checkHookOrder(fiber) {
+    const prev = fiber.alternate?.hooks
+    const curr = fiber.hooks
+    if (!prev || !curr) return
+    // 仅在 hook 数量或类型序列变化时警告（条件 hook 的典型征兆）
+    if (prev.length !== curr.length) {
+      console.warn(
+        `[mini-react] 检测到 hook 数量在两次渲染之间变化（${prev.length} → ${curr.length}）。` +
+        '请确保不在 if/loop/early-return 中调用 hook。'
+      )
+      return
+    }
+    for (let i = 0; i < curr.length; i++) {
+      const a = _hookTypeCode(prev[i])
+      const b = _hookTypeCode(curr[i])
+      if (a !== b) {
+        console.warn(
+          `[mini-react] hook 顺序错乱：第 ${i} 个 hook 类型从 "${a}" 变为 "${b}"。` +
+          '常见原因是把 hook 放进了条件分支。'
+        )
+        break
+      }
+    }
   }
 
   /**
@@ -678,14 +742,18 @@
 
       if (cur.effectTag === 'PLACEMENT' && cur.dom) {
         if (parentDom) parentDom.appendChild(cur.dom)
-        commitRefBinding(cur)
       } else if (cur.effectTag === 'UPDATE' && cur.dom) {
         updateDom(cur.dom, cur.alternate.props, cur.props)
-        commitRefBinding(cur)
       } else if (cur.effectTag === 'DELETION') {
         if (parentDom) commitDeletion(cur, parentDom)
         node = cur.sibling
         continue
+      }
+
+      // ref 绑定：host 元素绑到 DOM，类组件绑到 instance；
+      // 函数组件没有 ref（forwardRef 透传，由内部 host/class 子节点完成）。
+      if (cur.effectTag !== 'DELETION' && cur.ref && (cur.dom || cur.instance)) {
+        commitRefBinding(cur)
       }
 
       commitWork(cur.child)
@@ -841,18 +909,42 @@
     }
   }
 
+  /**
+   * runUnmountEffects —— 卸载子树时按 React 一致顺序释放资源。
+   *
+   * 顺序（与真实 React commitDeletionEffects 一致）：
+   *   1. 先递归卸载所有子节点（子节点 cleanup 早于父节点）
+   *      → 这样子节点的 effect cleanup 还能访问父节点上下文（DOM、context）
+   *   2. 父节点自身的 effect cleanup（useEffect / useLayoutEffect / useInsertionEffect）
+   *   3. 类组件 componentWillUnmount
+   *   4. ref 解绑（host 元素 → DOM 置 null；类组件 → 实例置 null）
+   *
+   * 修复：原版先调父节点 cleanup 再递归子节点，与 React 行为相反。
+   * 子节点 cleanup 中若访问父节点资源（如 DOM）会拿到已被父级清理过的状态。
+   */
   function runUnmountEffects(fiber) {
     if (!fiber) return
-    if (fiber.hooks) {
-      fiber.hooks.forEach(hook => {
-        if ((hook._isEffect || hook._isLayoutEffect || hook._isInsertionEffect) && hook.cleanup) hook.cleanup()
-      })
-    }
-    fiber.instance?.componentWillUnmount?.()
-    // ref 从 fiber 顶层取（v3）
-    if (fiber.dom && fiber.ref) setRef(fiber.ref, null)
+    // 1. 先递归子节点（DFS 后序）
     let child = fiber.child
     while (child) { runUnmountEffects(child); child = child.sibling }
+    // 2. effect cleanup
+    if (fiber.hooks) {
+      fiber.hooks.forEach(hook => {
+        if ((hook._isEffect || hook._isLayoutEffect || hook._isInsertionEffect) && hook.cleanup) {
+          try { hook.cleanup() } catch (e) { console.error('[unmount cleanup]', e) }
+        }
+      })
+    }
+    // 3. 类组件生命周期
+    if (fiber.instance) {
+      try { fiber.instance.componentWillUnmount?.() }
+      catch (e) { console.error('[componentWillUnmount]', e) }
+    }
+    // 4. ref 解绑（host → DOM；class → instance）
+    if (fiber.ref) {
+      const target = fiber.dom || fiber.instance
+      if (target) setRef(fiber.ref, null)
+    }
   }
 
   function removeDomNodes(fiber, parentDom) {
@@ -891,6 +983,8 @@
    * 设置 DOM 属性的统一入口：根据值类型走不同分支。
    *   - 函数：忽略（事件已在另一分支处理）
    *   - dangerouslySetInnerHTML：直接写 innerHTML
+   *   - defaultValue/defaultChecked：仅初次挂载时生效（与 React 一致）
+   *   - value/checked 受控：IDL 赋值，但当组件未提供 onChange 时给出警告
    *   - 布尔属性：用 IDL 赋值（dom[k] = !!value）
    *   - data-* / aria-*：用 setAttribute（DOM 没有这些 property）
    *   - 其它：优先 IDL，fallback 到 setAttribute
@@ -902,6 +996,31 @@
     }
     if (key === 'className') { dom.className = value ?? ''; return }
     if (key === 'style')     { return /* 由 updateStyle 处理 */ }
+    // ── 非受控初值：defaultValue / defaultChecked ───────────────
+    // React 行为：defaultValue 仅写一次（mount 时），后续更新由用户输入控制
+    if (key === 'defaultValue') {
+      // 只在没有 value 属性时设置 defaultValue（避免覆盖受控 value）
+      if (!('value' in dom) || dom.value === '' || dom.value == null) {
+        if (value != null) dom.value = value
+      }
+      // 同时把 defaultValue 属性写入便于 form reset 行为正确
+      if (value != null) dom.defaultValue = value
+      return
+    }
+    if (key === 'defaultChecked') {
+      if (typeof value === 'boolean') dom.defaultChecked = value
+      return
+    }
+    // ── 受控 value：跳过相同值赋值，避免光标跳动 ────────────────
+    if (key === 'value') {
+      // input/textarea 当用户连续输入时，每次 React 用同一值再赋 dom.value 会
+      // 把光标重置到末尾——React 通过 "已是相同值" 检查避免这种问题。
+      if (dom.tagName === 'INPUT' || dom.tagName === 'TEXTAREA' || dom.tagName === 'SELECT') {
+        const v = value == null ? '' : value
+        if (dom.value !== v) dom.value = v
+        return
+      }
+    }
     if (BOOLEAN_PROPS.has(key)) { dom[key] = !!value; return }
     if (key.startsWith('data-') || key.startsWith('aria-')) {
       if (value == null || value === false) dom.removeAttribute(key)
@@ -963,30 +1082,81 @@
   }
 
   /**
-   * commitRefBinding —— 在 commit 阶段同步 fiber.ref 到 DOM 节点。
+   * commitRefBinding —— 在 commit 阶段同步 fiber.ref 到目标。
    *
    * 时机：PLACEMENT 后（DOM 已挂载）/ UPDATE 时若 ref 变化。
    * 对应 React 的 commitAttachRef / commitDetachRef。
+   *
+   * 目标解析（与真实 React 完全一致）：
+   *   - host 元素（fiber.dom 存在） → 绑定到 DOM
+   *   - 类组件（fiber.instance 存在） → 绑定到实例
+   *   - 函数组件 → 不绑定（function 组件没有 ref；要透传得用 forwardRef）
+   *
+   * 修复（v4）：原版只支持 host 元素的 ref；现在补齐类组件 ref 到 instance 的绑定，
+   * 与 `<MyClassComp ref={r}/>  →  r.current = instance` 的 React 行为对齐。
    */
   function commitRefBinding(fiber) {
     const newRef = fiber.ref
     const oldRef = fiber.alternate?.ref
+    const target = fiber.dom || fiber.instance
     if (oldRef === newRef) {
-      // PLACEMENT 时 alternate 为 null，oldRef === newRef === undefined 会跳过；
-      // 但我们想在 mount 时绑定，所以单独判断
-      if (!fiber.alternate && newRef && fiber.dom) setRef(newRef, fiber.dom)
+      // mount 路径：alternate 为 null，但仍需要做首次绑定
+      if (!fiber.alternate && newRef && target) setRef(newRef, target)
       return
     }
     if (oldRef) setRef(oldRef, null)
-    if (newRef && fiber.dom) setRef(newRef, fiber.dom)
+    if (newRef && target) setRef(newRef, target)
+  }
+
+  /**
+   * 与 React 一致的 unitless 属性集合：这些属性即便是数字也不应自动追加 'px'。
+   * 名单来源：react-dom/src/shared/CSSProperty.js
+   */
+  const CSS_UNITLESS = new Set([
+    'animationIterationCount', 'borderImageOutset', 'borderImageSlice', 'borderImageWidth',
+    'boxFlex', 'boxFlexGroup', 'boxOrdinalGroup', 'columnCount', 'columns', 'flex',
+    'flexGrow', 'flexShrink', 'fontWeight', 'gridArea', 'gridColumn', 'gridColumnEnd',
+    'gridColumnStart', 'gridRow', 'gridRowEnd', 'gridRowStart', 'lineClamp', 'lineHeight',
+    'opacity', 'order', 'orphans', 'tabSize', 'widows', 'zIndex', 'zoom',
+    // SVG
+    'fillOpacity', 'floodOpacity', 'stopOpacity', 'strokeDasharray', 'strokeDashoffset',
+    'strokeMiterlimit', 'strokeOpacity', 'strokeWidth',
+  ])
+
+  /**
+   * 设置单个 style 字段：与 React 行为一致——数字值自动追加 'px'，
+   * 在 CSS_UNITLESS 中的属性除外。
+   *
+   * 修复：原版用 Object.assign 直接拷贝，dom.style.width = 12（数字）在浏览器
+   * 中通常被忽略（CSS 期望长度单位）。React 的解决方案是把数字翻译成
+   * '12px'，本实现对齐。
+   */
+  function setStyleProp(dom, key, value) {
+    if (value == null || value === false) {
+      dom.style[key] = ''
+      return
+    }
+    if (typeof value === 'number' && !CSS_UNITLESS.has(key)) {
+      dom.style[key] = value + 'px'
+    } else {
+      dom.style[key] = value
+    }
   }
 
   function updateStyle(dom, prev, next) {
     if (typeof prev === 'string' && typeof next !== 'string') dom.style.cssText = ''
-    if (prev && typeof prev === 'object')
+    if (prev && typeof prev === 'object') {
       Object.keys(prev).forEach(k => { if (!next || !(k in next)) dom.style[k] = '' })
-    if (typeof next === 'string') dom.style.cssText = next
-    else if (next && typeof next === 'object') Object.assign(dom.style, next)
+    }
+    if (typeof next === 'string') {
+      dom.style.cssText = next
+    } else if (next && typeof next === 'object') {
+      Object.keys(next).forEach(k => {
+        // 跳过未变更的字段，避免触发不必要的 style 重计算
+        if (prev && typeof prev === 'object' && Object.is(prev[k], next[k])) return
+        setStyleProp(dom, k, next[k])
+      })
+    }
   }
 
   function setRef(ref, value) {
@@ -1023,7 +1193,30 @@
    * 第三参数 init 用于惰性初始化：useReducer(reducer, props, p => createInitialState(p))
    * init 仅在首次渲染（无 alternate）时被调用。
    */
+  /**
+   * 守护：所有 hook 入口共用的"必须在组件渲染期内调用"检查。
+   *
+   * 真实 React 错误：
+   *   "Invalid hook call. Hooks can only be called inside of the body of a function component."
+   *
+   * 触发条件：在组件函数体之外（事件回调、setTimeout、模块顶层、类组件方法等）
+   * 调用 hook，会导致 wipFiber 为 null 或不属于本次渲染——状态/effect 全部丢失。
+   * 与其神秘报 "Cannot read properties of null"，不如直接抛出可读错误。
+   */
+  function assertInRender(hookName) {
+    if (!wipFiber || !Array.isArray(wipFiber.hooks)) {
+      throw new Error(
+        `[mini-react] Invalid hook call: ${hookName}() 必须在函数组件渲染过程中调用。\n` +
+        '常见原因：\n' +
+        '  1. 在事件处理器 / setTimeout / 异步回调中调用了 hook\n' +
+        '  2. 在类组件的方法或模块顶层调用了 hook\n' +
+        '  3. 多个 mini-react 实例同时存在'
+      )
+    }
+  }
+
   function useReducer(reducer, initialState, init) {
+    assertInRender('useReducer')
     const oldHook = wipFiber.alternate?.hooks?.[hookIndex]
     const queue   = oldHook ? oldHook.queue : []
     const hook    = {
@@ -1031,7 +1224,19 @@
       queue,
       reducer,                                  // 缓存 reducer 用于 eager bailout
     }
-    queue.splice(0).forEach(action => { hook.state = reducer(hook.state, action) })
+    // 消费 action 队列：若 reducer 误返回 undefined，保持原 state 并警告
+    // （与 React 行为一致：React 也会发出 "useReducer: reducer returned undefined" 警告）
+    queue.splice(0).forEach(action => {
+      const next = reducer(hook.state, action)
+      if (next === undefined) {
+        console.warn(
+          '[mini-react] useReducer: reducer 返回了 undefined。' +
+          '这通常是某个 case 分支没有 return 导致的——请确保所有路径都返回 state。'
+        )
+        return
+      }
+      hook.state = next
+    })
     // 与真实 React 对齐：dispatch 引用基于 hook 稳定，且实现 eager bailout
     const dispatch = action => {
       // 仅当队列为空时尝试 eager 计算（队列非空意味着已经排队等待，
@@ -1082,6 +1287,7 @@
    *   卸载：       runUnmountEffects 调用 cleanup
    */
   function useEffect(callback, deps) {
+    assertInRender('useEffect')
     const old  = wipFiber.alternate?.hooks?.[hookIndex]
     const hook = { _isEffect: true, deps, cleanup: old?.cleanup ?? null,
       callback: haveDepsChanged(old?.deps, deps) ? callback : null }
@@ -1094,6 +1300,7 @@
    * 执行顺序：useInsertionEffect → useLayoutEffect → useEffect（异步）
    */
   function useLayoutEffect(callback, deps) {
+    assertInRender('useLayoutEffect')
     const old  = wipFiber.alternate?.hooks?.[hookIndex]
     const hook = { _isLayoutEffect: true, deps, cleanup: old?.cleanup ?? null,
       callback: haveDepsChanged(old?.deps, deps) ? callback : null }
@@ -1117,6 +1324,7 @@
    *   5. useEffect（绘制后异步）
    */
   function useInsertionEffect(callback, deps) {
+    assertInRender('useInsertionEffect')
     const old  = wipFiber.alternate?.hooks?.[hookIndex]
     const hook = { _isInsertionEffect: true, deps, cleanup: old?.cleanup ?? null,
       callback: haveDepsChanged(old?.deps, deps) ? callback : null }
@@ -1125,6 +1333,7 @@
 
   /** useMemo —— 缓存昂贵计算，deps 不变时返回旧值。factory 须为纯函数。 */
   function useMemo(factory, deps) {
+    assertInRender('useMemo')
     const old  = wipFiber.alternate?.hooks?.[hookIndex]
     const hook = { value: haveDepsChanged(old?.deps, deps) ? factory() : old.value, deps }
     wipFiber.hooks.push(hook); hookIndex++
@@ -1296,6 +1505,10 @@
 
   /** useContext —— 读取最近 Provider 注入的值，占位保持 hookIndex 连续。 */
   function useContext(context) {
+    assertInRender('useContext')
+    if (!context || !('_currentValue' in context)) {
+      throw new Error('[mini-react] useContext: 参数必须是 createContext() 的返回值')
+    }
     wipFiber.hooks.push({ _isContext: true })
     hookIndex++
     return context._currentValue
@@ -1388,7 +1601,13 @@
    */
   function createPortal(children, container) {
     const kids = Array.isArray(children) ? children : (children != null ? [children] : [])
-    return { type: PORTAL, props: { container, children: kids } }
+    return {
+      $$typeof: REACT_ELEMENT_TYPE,
+      type: PORTAL,
+      key: null,
+      ref: null,
+      props: { container, children: kids },
+    }
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -1456,11 +1675,16 @@
   /**
    * StrictMode —— 开发辅助：透明渲染（此实现不做双调用检测，仅作 API 占位）。
    * 在真实 React 开发模式下，StrictMode 会对副作用进行双调用检测。
+   *
+   * 标记 _isStrictMode 与 React 内部 REACT_STRICT_MODE Symbol 同义，
+   * 方便未来扩展严格模式相关的开发期检查（如效果双调用、过时 API 警告等）。
    */
   function StrictMode({ children }) {
     if (!children) return null
     return Array.isArray(children) ? createElement(Fragment, null, ...children) : children
   }
+  StrictMode._isStrictMode = true
+  StrictMode._symbol = REACT_STRICT_MODE
 
   // ─────────────────────────────────────────────────────────────
   // § 13  高阶组件：forwardRef / memo
