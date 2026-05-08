@@ -37,7 +37,14 @@
    * Babel 把 JSX 转换为本函数调用：
    *   JSX：    <div className="a">hi</div>
    *   编译后： createElement('div', { className: 'a' }, 'hi')
-   *   产出：   { type: 'div', props: { className: 'a', children: [{type:'TEXT_ELEMENT',...}] } }
+   *   产出：   { type: 'div', key: null, ref: null,
+   *             props: { className: 'a', children: [{type:'TEXT_ELEMENT',...}] } }
+   *
+   * 关键对齐点（v3）：与真实 React 一致，把 key 和 ref 提到 element 顶层，
+   * 不再写入 props。这样：
+   *   - 组件函数收到的 props 不会包含 key/ref（React 行为）
+   *   - memo 浅比较不会受 ref 切换干扰
+   *   - 协调器可在不读 props 的情况下做 keyed 匹配
    *
    * children 处理流水线：
    *   1. flat(Infinity)：把嵌套数组展平为一维（[a, [b, c], [d]] → [a, b, c, d]）
@@ -45,42 +52,70 @@
    *      （注意：0 / '' 不会被过滤，会作为文本节点显示，这与真实 React 一致）
    *   3. 非对象（字符串/数字）包装成 TEXT_ELEMENT，方便 reconciler 统一处理
    *
-   * ⚠️ 注意：本实现把 key/ref 与其它 props 一同放在 props 上（简化版），
-   *    与 React 把 key/ref 提到 element 顶层略有不同，但功能等价。
+   * defaultProps：渲染期由 updateFunctionComponent / updateClassComponent 应用。
    */
-  function createElement(type, props, ...children) {
-    return {
-      type,
-      props: {
-        ...props,
-        children: children
-          .flat(Infinity)
-          .filter(c => c !== null && c !== undefined && typeof c !== 'boolean')
-          .map(c => (typeof c === 'object' ? c : createTextElement(c))),
-      },
+  function createElement(type, config, ...children) {
+    let key = null
+    let ref = null
+    const props = {}
+    if (config != null) {
+      for (const k in config) {
+        if (k === 'key') {
+          if (config.key !== undefined) key = '' + config.key  // React 把 key 强制转 string
+        } else if (k === 'ref') {
+          if (config.ref !== undefined) ref = config.ref
+        } else {
+          props[k] = config[k]
+        }
+      }
     }
+    props.children = children
+      .flat(Infinity)
+      .filter(c => c !== null && c !== undefined && typeof c !== 'boolean')
+      .map(c => (typeof c === 'object' ? c : createTextElement(c)))
+    return { type, key, ref, props }
   }
 
   function createTextElement(text) {
-    return { type: 'TEXT_ELEMENT', props: { nodeValue: String(text), children: [] } }
+    return {
+      type: 'TEXT_ELEMENT',
+      key: null,
+      ref: null,
+      props: { nodeValue: String(text), children: [] },
+    }
   }
 
   /**
-   * cloneElement —— 克隆元素并合并新 props / key / ref / children。
-   * 新 children 若传入则完全覆盖旧 children。
+   * cloneElement —— 克隆元素并合并新 config / children。
+   *
+   * 行为与 React 一致：
+   *   - key 默认继承元素，config.key 不为 undefined 时覆盖
+   *   - ref 同上
+   *   - 其它 props 合并（config 覆盖 element.props）
+   *   - 新 children 若传入则完全替换旧 children
    */
   function cloneElement(element, config, ...children) {
-    const { key, ref, ...rest } = config || {}
-    const props = { ...element.props, ...rest }
-    if (key !== undefined) props.key = key
-    if (ref !== undefined) props.ref = ref
+    let key = element.key
+    let ref = element.ref
+    const props = { ...element.props }
+    if (config != null) {
+      for (const k in config) {
+        if (k === 'key') {
+          if (config.key !== undefined) key = '' + config.key
+        } else if (k === 'ref') {
+          if (config.ref !== undefined) ref = config.ref
+        } else if (config[k] !== undefined) {
+          props[k] = config[k]
+        }
+      }
+    }
     if (children.length > 0) {
       props.children = children
         .flat(Infinity)
         .filter(c => c !== null && c !== undefined && typeof c !== 'boolean')
         .map(c => (typeof c === 'object' ? c : createTextElement(c)))
     }
-    return { type: element.type, props }
+    return { type: element.type, key, ref, props }
   }
 
   /**
@@ -204,7 +239,7 @@
    *   1. 设置 hooks 上下文（wipFiber / hookIndex）
    *   2. memo bailout：props 未变 + 无排队 state → 复用上次结果
    *   3. Context.Provider 作用域：进入时注入值，退出时（completeUnitOfWork）恢复
-   *   4. forwardRef：把 fiber.props.ref 以第二参数传给渲染函数
+   *   4. forwardRef：把 fiber.ref（element 顶层 ref）以第二参数传给渲染函数
    *   5. Suspense 集成：catch 子组件抛出的 Promise，标记 boundary
    */
   function updateFunctionComponent(fiber) {
@@ -215,6 +250,11 @@
     const component = fiber.type
     const isMemo    = !!component._isMemo
 
+    // ── defaultProps：把组件声明的默认值合并到 fiber.props ──────
+    // 与 React 行为一致：仅当 props[k] === undefined 时使用默认值
+    // （null 视为有意传入的空值，不被覆盖）。
+    applyDefaultProps(fiber, isMemo ? component._type : component)
+
     // ── memo bailout ──────────────────────────────────────────
     if (isMemo && fiber.alternate) {
       const hasPending = fiber.alternate.hooks?.some(h => h.queue?.length > 0)
@@ -222,7 +262,7 @@
         wipFiber.hooks = fiber.alternate.hooks || []
         const cached = fiber.alternate.memoizedElement
         fiber.memoizedElement = cached
-        reconcileChildren(fiber, Array.isArray(cached) ? cached : [cached])
+        reconcileChildren(fiber, normalizeRenderOutput(cached))
         return
       }
     }
@@ -241,25 +281,35 @@
     }
 
     // ── 调用渲染函数（forwardRef 透传 ref） ───────────────────
+    // ref 从 fiber 顶层读取（v3：与真实 React 对齐，ref 不在 props 中）
     let child
     try {
       if (renderFn._isForwardRef) {
-        child = renderFn._renderFn(fiber.props, fiber.props.ref ?? null)
+        child = renderFn._renderFn(fiber.props, fiber.ref ?? null)
       } else {
         child = renderFn(fiber.props)
       }
     } catch (e) {
-      // ── Suspense：捕获 Promise（lazy 抛出）──────────────────
+      // ── Suspense：捕获 Promise（lazy / use(promise) 抛出）─────
+      // 修复（v3）：原版用 _suspendPending 单字段保存最后一个 Promise，
+      // 多个子组件同时挂起时前面的 Promise 解决会过早清空标志，
+      // 导致 Suspense 把还在挂起的内容当已就绪渲染（出现错位）。
+      // 新版用 _pendingSet（Set）跟踪所有未解决的 Promise，全部 resolve
+      // 后才取消 fallback；同时去重避免对同一 Promise 重复挂回调。
       if (e && typeof e.then === 'function') {
         let boundary = fiber.return
         while (boundary && !boundary.type?._isSuspense) boundary = boundary.return
         if (boundary) {
-          boundary._suspendPending = e
+          if (!boundary._pendingSet) boundary._pendingSet = new Set()
+          if (!boundary._pendingSet.has(e)) {
+            boundary._pendingSet.add(e)
+            const onSettle = () => {
+              boundary._pendingSet?.delete(e)
+              scheduleRerender()
+            }
+            e.then(onSettle, onSettle)
+          }
           needsRerenderAfterCommit = true
-          e.then(
-            () => { delete boundary._suspendPending; scheduleRerender() },
-            () => { delete boundary._suspendPending; scheduleRerender() }
-          )
         }
         fiber.memoizedElement = null
         reconcileChildren(fiber, [])
@@ -275,7 +325,38 @@
     }
 
     fiber.memoizedElement = child
-    reconcileChildren(fiber, Array.isArray(child) ? child : [child])
+    reconcileChildren(fiber, normalizeRenderOutput(child))
+  }
+
+  /**
+   * normalizeRenderOutput —— 把组件 render 的返回值统一为 element 数组。
+   *
+   * React 允许组件返回：element / 数组 / 字符串 / 数字 / null / boolean。
+   * 本函数把所有合法形态规范化成 reconcileChildren 能处理的 element 数组：
+   *   - null / undefined / boolean → []
+   *   - string / number             → [TEXT_ELEMENT]
+   *   - 数组                          → 递归展平 + 每个元素同样规范化
+   *   - element                      → [element]
+   *
+   * 修复：原版直接 `Array.isArray(child) ? child : [child]`，当 child 为 string
+   * 或 number 时会传入 reconcileChildren，element.type 为 undefined 触发崩溃。
+   */
+  function normalizeRenderOutput(child) {
+    if (child == null || typeof child === 'boolean') return []
+    if (typeof child === 'string' || typeof child === 'number') {
+      return [createTextElement(child)]
+    }
+    if (Array.isArray(child)) {
+      const out = []
+      for (const c of child.flat(Infinity)) {
+        if (c == null || typeof c === 'boolean') continue
+        if (typeof c === 'string' || typeof c === 'number') out.push(createTextElement(c))
+        else if (typeof c === 'object') out.push(c)
+      }
+      return out
+    }
+    if (typeof child === 'object') return [child]
+    return []
   }
 
   /**
@@ -284,20 +365,35 @@
    * getDerivedStateFromProps / shouldComponentUpdate 均在此处理。
    */
   function updateClassComponent(fiber) {
+    // ── defaultProps（与函数组件一致）────────────────────────
+    applyDefaultProps(fiber, fiber.type)
+
     // ── PropTypes 校验（开发期）──────────────────────────────
     if (fiber.type.propTypes) validateProps(fiber.type, fiber.props)
 
+    // ── static contextType：从静态字段读取 context ───────────
+    // 用法：class Foo extends Component { static contextType = ThemeContext; ... }
+    // → render 时 this.context 可读
+    const ctxType = fiber.type.contextType
+    const ctxValue = ctxType && '_currentValue' in ctxType ? ctxType._currentValue : undefined
+
     let instance = fiber.instance
     if (!instance) {
-      instance = new fiber.type(fiber.props)
+      instance = new fiber.type(fiber.props, ctxValue)
       fiber.instance = instance
       instance._fiber = fiber
     } else {
       // 从 alternate 同步最新 state（setState 改的是旧实例）
       if (fiber.alternate?.instance) {
         instance.state = fiber.alternate.instance.state
+        // 把 alternate 实例上累积的回调队列也搬过来（确保不丢失）
+        if (fiber.alternate.instance._pendingCallbacks?.length) {
+          instance._pendingCallbacks.push(...fiber.alternate.instance._pendingCallbacks)
+          fiber.alternate.instance._pendingCallbacks.length = 0
+        }
       }
       instance.props  = fiber.props
+      instance.context = ctxValue
       instance._fiber = fiber
     }
 
@@ -317,13 +413,13 @@
       if (pu && shallowEqualProps(prevProps, fiber.props) && shallowEqualProps(prevState, instance.state)) {
         const cached = fiber.alternate.memoizedElement
         fiber.memoizedElement = cached
-        reconcileChildren(fiber, Array.isArray(cached) ? cached : [cached])
+        reconcileChildren(fiber, normalizeRenderOutput(cached))
         return
       }
       if (scu && !instance.shouldComponentUpdate(fiber.props, instance.state)) {
         const cached = fiber.alternate.memoizedElement
         fiber.memoizedElement = cached
-        reconcileChildren(fiber, Array.isArray(cached) ? cached : [cached])
+        reconcileChildren(fiber, normalizeRenderOutput(cached))
         return
       }
     }
@@ -341,7 +437,7 @@
       throw e
     }
     fiber.memoizedElement = child
-    reconcileChildren(fiber, Array.isArray(child) ? child : [child])
+    reconcileChildren(fiber, normalizeRenderOutput(child))
   }
 
   /**
@@ -420,13 +516,29 @@
       let newFiber
 
       if (sameType) {
-        newFiber = { type: oldMatch.type, props: element.props, dom: oldMatch.dom,
-          return: wipF, alternate: oldMatch, effectTag: 'UPDATE' }
+        newFiber = {
+          type: oldMatch.type,
+          key:  element.key,
+          ref:  element.ref,           // ref 从 element 顶层取（v3）
+          props: element.props,
+          dom:   oldMatch.dom,
+          return: wipF,
+          alternate: oldMatch,
+          effectTag: 'UPDATE',
+        }
         usedOld.add(oldMatch)
       }
       if (!sameType && element) {
-        newFiber = { type: element.type, props: element.props, dom: null,
-          return: wipF, alternate: null, effectTag: 'PLACEMENT' }
+        newFiber = {
+          type: element.type,
+          key:  element.key,
+          ref:  element.ref,
+          props: element.props,
+          dom:   null,
+          return: wipF,
+          alternate: null,
+          effectTag: 'PLACEMENT',
+        }
       }
       if (!sameType && oldMatch) {
         oldMatch.effectTag = 'DELETION'
@@ -477,6 +589,11 @@
   function commitRoot() {
     const root = wipRoot
     isCommitting = true
+
+    // ── Phase 0  Pre-mutation：getSnapshotBeforeUpdate ────────
+    // 在 DOM 突变之前调用，让组件读取"上一次提交时的真实 DOM"
+    // （例如滚动位置、文本选区），返回值会传给 componentDidUpdate(_, _, snapshot)。
+    commitGetSnapshotBeforeUpdate(root.child)
 
     deletions.forEach(fiber => commitWork(fiber))
     commitWork(root.child)
@@ -561,8 +678,10 @@
 
       if (cur.effectTag === 'PLACEMENT' && cur.dom) {
         if (parentDom) parentDom.appendChild(cur.dom)
+        commitRefBinding(cur)
       } else if (cur.effectTag === 'UPDATE' && cur.dom) {
         updateDom(cur.dom, cur.alternate.props, cur.props)
+        commitRefBinding(cur)
       } else if (cur.effectTag === 'DELETION') {
         if (parentDom) commitDeletion(cur, parentDom)
         node = cur.sibling
@@ -619,7 +738,16 @@
     }
   }
 
-  /** commitAllLayoutEffects —— useLayoutEffect + 类组件 componentDidMount/Update。 */
+  /**
+   * commitAllLayoutEffects —— useLayoutEffect + 类组件 componentDidMount/Update。
+   *
+   * 类组件生命周期顺序（v3，与真实 React 对齐）：
+   *   1. getSnapshotBeforeUpdate(prevProps, prevState) → snapshot
+   *      在 mutation 之前已经被 commitGetSnapshotBeforeUpdate 收集过；
+   *      此处只需把 snapshot 作为第三参数传给 cDU
+   *   2. componentDidMount / componentDidUpdate(prevProps, prevState, snapshot)
+   *   3. setState/forceUpdate 收集的 _pendingCallbacks 依次清空
+   */
   function commitAllLayoutEffects(fiber) {
     let node = fiber
     while (node) {
@@ -636,10 +764,51 @@
         if (!node.alternate) {
           node.instance.componentDidMount?.()
         } else {
-          node.instance.componentDidUpdate?.(node.alternate.props, node.alternate.instance?.state ?? {})
+          const prevProps = node.alternate.props
+          const prevState = node.alternate.instance?.state ?? {}
+          const snapshot  = node._snapshot  // 由 commitGetSnapshotBeforeUpdate 写入
+          node.instance.componentDidUpdate?.(prevProps, prevState, snapshot)
+        }
+        // 清空 setState/forceUpdate 的回调队列（按入队顺序调用）
+        const cbs = node.instance._pendingCallbacks
+        if (cbs && cbs.length) {
+          const queue = cbs.splice(0)
+          queue.forEach(cb => {
+            try { cb.call(node.instance) }
+            catch (e) { console.error('[setState callback]', e) }
+          })
         }
       }
       commitAllLayoutEffects(node.child)
+      node = node.sibling
+    }
+  }
+
+  /**
+   * commitGetSnapshotBeforeUpdate —— mutation 前调用类组件的 getSnapshotBeforeUpdate。
+   *
+   * 时机：DOM 突变之前（这是 React 引入此生命周期的核心目的——
+   *   读取上一次提交时的真实 DOM 状态，例如滚动位置、文本选区，
+   *   再在 cDU 中根据 snapshot 决定是否复位）。
+   *
+   * 返回值会写入 fiber._snapshot，commitAllLayoutEffects 中作为
+   * componentDidUpdate 的第三参数传给实例。
+   */
+  function commitGetSnapshotBeforeUpdate(fiber) {
+    let node = fiber
+    while (node) {
+      if (node.instance && node.alternate && typeof node.instance.getSnapshotBeforeUpdate === 'function') {
+        try {
+          node._snapshot = node.instance.getSnapshotBeforeUpdate(
+            node.alternate.props,
+            node.alternate.instance?.state ?? {},
+          )
+        } catch (e) {
+          console.error('[getSnapshotBeforeUpdate]', e)
+          node._snapshot = null
+        }
+      }
+      commitGetSnapshotBeforeUpdate(node.child)
       node = node.sibling
     }
   }
@@ -680,7 +849,8 @@
       })
     }
     fiber.instance?.componentWillUnmount?.()
-    if (fiber.dom && fiber.props?.ref) setRef(fiber.props.ref, null)
+    // ref 从 fiber 顶层取（v3）
+    if (fiber.dom && fiber.ref) setRef(fiber.ref, null)
     let child = fiber.child
     while (child) { runUnmountEffects(child); child = child.sibling }
   }
@@ -765,10 +935,13 @@
     try { dom[key] = '' } catch { /* 忽略只读属性 */ }
   }
 
+  /**
+   * updateDom —— 在 mutation 阶段把 prev props 与 next props 的差异同步到 DOM。
+   *
+   * v3：ref 不再放在 props 中，ref 的绑定/解绑在 commitWork 中独立处理，
+   *     避免 memo / reconcile 的 props 比较把 ref 也包括进来。
+   */
   function updateDom(dom, prev, next) {
-    // ── ref 解绑：旧 ref 与新 ref 不同时，先把旧 ref 置 null ──────
-    if (prev.ref !== next.ref) setRef(prev.ref, null)
-
     // ── 事件：移除已删除/已变更的事件 ─────────────────────────────
     Object.keys(prev).filter(isEvent).filter(k => !(k in next) || isNew(prev, next)(k))
       .forEach(k => dom.removeEventListener(toEvt(k), prev[k]))
@@ -787,9 +960,25 @@
     // ── 事件：添加新增/已变更的事件 ───────────────────────────────
     Object.keys(next).filter(isEvent).filter(isNew(prev, next))
       .forEach(k => dom.addEventListener(toEvt(k), next[k]))
+  }
 
-    // ── ref 绑定：把新 ref 指向当前 DOM ───────────────────────────
-    if (prev.ref !== next.ref) setRef(next.ref, dom)
+  /**
+   * commitRefBinding —— 在 commit 阶段同步 fiber.ref 到 DOM 节点。
+   *
+   * 时机：PLACEMENT 后（DOM 已挂载）/ UPDATE 时若 ref 变化。
+   * 对应 React 的 commitAttachRef / commitDetachRef。
+   */
+  function commitRefBinding(fiber) {
+    const newRef = fiber.ref
+    const oldRef = fiber.alternate?.ref
+    if (oldRef === newRef) {
+      // PLACEMENT 时 alternate 为 null，oldRef === newRef === undefined 会跳过；
+      // 但我们想在 mount 时绑定，所以单独判断
+      if (!fiber.alternate && newRef && fiber.dom) setRef(newRef, fiber.dom)
+      return
+    }
+    if (oldRef) setRef(oldRef, null)
+    if (newRef && fiber.dom) setRef(newRef, fiber.dom)
   }
 
   function updateStyle(dom, prev, next) {
@@ -837,9 +1026,27 @@
   function useReducer(reducer, initialState, init) {
     const oldHook = wipFiber.alternate?.hooks?.[hookIndex]
     const queue   = oldHook ? oldHook.queue : []
-    const hook    = { state: oldHook ? oldHook.state : (init ? init(initialState) : initialState), queue }
+    const hook    = {
+      state:   oldHook ? oldHook.state : (init ? init(initialState) : initialState),
+      queue,
+      reducer,                                  // 缓存 reducer 用于 eager bailout
+    }
     queue.splice(0).forEach(action => { hook.state = reducer(hook.state, action) })
-    const dispatch = action => { hook.queue.push(action); scheduleRerender() }
+    // 与真实 React 对齐：dispatch 引用基于 hook 稳定，且实现 eager bailout
+    const dispatch = action => {
+      // 仅当队列为空时尝试 eager 计算（队列非空意味着已经排队等待，
+      // 此时不能跳过——否则会丢失一批 action）。
+      if (hook.queue.length === 0) {
+        let eagerNext
+        try { eagerNext = hook.reducer(hook.state, action) }
+        catch { eagerNext = undefined }
+        // 如果 reducer 是纯函数，且 next 与 state 引用相同，
+        // 直接 bailout，连入队都省了（与 React 的 eager bailout 一致）。
+        if (eagerNext !== undefined && Object.is(eagerNext, hook.state)) return
+      }
+      hook.queue.push(action)
+      scheduleRerender()
+    }
     wipFiber.hooks.push(hook)
     hookIndex++
     return [hook.state, dispatch]
@@ -1116,19 +1323,40 @@
    *   render() → element（必须实现）
    */
   class Component {
-    constructor(props) {
+    constructor(props, context) {
       this.props = props
       this.state = {}
+      // static contextType：消费一个 context（与 React 行为一致）
+      this.context = context
       this._fiber = null
+      // setState/forceUpdate 的 callback 队列：commit 后按入队顺序逐一调用
+      this._pendingCallbacks = []
     }
 
-    setState(updater) {
-      const next = typeof updater === 'function' ? updater(this.state) : updater
+    /**
+     * setState(updater, callback?) —— 触发重渲染。
+     * @param updater   新 state 对象（浅合并）或 (prevState, props) => partial
+     * @param callback  可选，commit 完成后调用（DOM 已更新；可读取 this.state）
+     */
+    setState(updater, callback) {
+      const next = typeof updater === 'function'
+        ? updater(this.state, this.props)
+        : updater
+      // null/undefined → React bail-out（什么都不做）
+      if (next == null) {
+        if (typeof callback === 'function') this._pendingCallbacks.push(callback)
+        return
+      }
       this.state = { ...this.state, ...next }
+      if (typeof callback === 'function') this._pendingCallbacks.push(callback)
       if (this._fiber) scheduleRerender()
     }
 
-    forceUpdate() {
+    /**
+     * forceUpdate(callback?) —— 强制重渲染，跳过 shouldComponentUpdate。
+     */
+    forceUpdate(callback) {
+      if (typeof callback === 'function') this._pendingCallbacks.push(callback)
       if (this._fiber) scheduleRerender()
     }
 
@@ -1183,8 +1411,11 @@
    *    真实 React 通过 concurrent 模式避免了这个闪烁。
    */
   function Suspense({ children, fallback }) {
-    // wipFiber.alternate._suspendPending 由 updateFunctionComponent catch 分支写入
-    if (wipFiber.alternate?._suspendPending) {
+    // wipFiber.alternate._pendingSet 由 updateFunctionComponent catch 分支写入
+    // 集合非空 → 还有 Promise 未解决，渲染 fallback；
+    // 集合为空或不存在 → 所有 Promise 已 settle，渲染真实 children。
+    const pending = wipFiber.alternate?._pendingSet
+    if (pending && pending.size > 0) {
       return fallback ?? null
     }
     if (!children) return null
@@ -1242,14 +1473,16 @@
    *   const Input = forwardRef((props, ref) => <input ref={ref} {...props}/>)
    *   <Input ref={myRef}/>  →  myRef.current = input DOM
    *
-   * 实现：返回带 _isForwardRef 标记的包装函数，
-   * updateFunctionComponent 检测到标记后把 props.ref 作为第二参数传入。
+   * 实现：返回带 _isForwardRef 标记的包装函数；
+   * updateFunctionComponent 检测到标记后把 fiber.ref（element 顶层 ref）
+   * 作为第二参数传入 _renderFn。包装函数 ForwardRef 本身不会被直接调用——
+   * 但保留它以便诸如 React.isValidElement / type 判等等场景识别。
    */
   function forwardRef(renderFn) {
-    function ForwardRef(props) { return renderFn(props, props.ref ?? null) }
+    function ForwardRef(props) { return renderFn(props, null) }
     ForwardRef._isForwardRef = true
     ForwardRef._renderFn     = renderFn
-    ForwardRef.displayName   = `forwardRef(${renderFn.name || 'Component'})`
+    ForwardRef.displayName   = `forwardRef(${renderFn.displayName || renderFn.name || 'Component'})`
     return ForwardRef
   }
 
@@ -1485,8 +1718,32 @@
     return next.some((d, i) => !Object.is(d, prev[i]))
   }
 
-  function getElementKey(el) { return el?.props?.key ?? null }
-  function getFiberKey(f)    { return f?.props?.key  ?? null }
+  // key/ref 已迁到 element/fiber 顶层（v3）
+  function getElementKey(el) { return el?.key ?? null }
+  function getFiberKey(f)    { return f?.key  ?? null }
+
+  /**
+   * applyDefaultProps —— 与真实 React 一致的默认 props 合并策略。
+   *
+   * 用法：
+   *   function MyComp({ size }) { ... }
+   *   MyComp.defaultProps = { size: 'medium' }
+   *
+   * 规则：
+   *   - 仅当 props[k] === undefined 时填默认值（null 不会被覆盖）
+   *   - 不会污染原 fiber.props 之外的对象
+   *   - 没有 defaultProps 时直接 return，零额外开销
+   */
+  function applyDefaultProps(fiber, component) {
+    const dp = component?.defaultProps
+    if (!dp) return
+    const merged = { ...fiber.props }
+    let touched = false
+    for (const k in dp) {
+      if (merged[k] === undefined) { merged[k] = dp[k]; touched = true }
+    }
+    if (touched) fiber.props = merged
+  }
 
   /**
    * propagateError —— 向上遍历 Fiber 树，寻找最近的 Error Boundary 并应用错误状态。
@@ -1538,31 +1795,76 @@
   function createRef(initialValue = null) { return { current: initialValue } }
 
   /**
-   * Children —— 安全操作 children prop 的工具集。
-   * 统一展平并过滤 null/undefined/boolean，提供稳定的遍历接口。
+   * Children —— 安全操作 children prop 的工具集（与 React.Children 行为对齐）。
    *
-   * 与 React 的对齐：
-   *   - toArray 会为没有 key 的元素分配位置 key（'.0', '.1' ...），
-   *     方便 map 后再次作为子节点时不会触发"missing key"警告。
-   *   - 过滤掉 boolean 与 null/undefined（条件渲染产物）。
+   * v3 关键改动：
+   *   - key 写到 element 顶层而非 props（与 React 一致）
+   *   - toArray 对嵌套数组使用前缀 '.<i>' / '.<i>:.<j>' 形式，
+   *     映射后再当作 children 时仍保持稳定 key（避免列表重新挂载）
+   *   - map 的回调返回值若是合法 element 且没有显式 key，
+   *     会在原 key 前加上当前位置前缀（实现 key 链路追踪）
+   *
+   * 过滤规则：剔除 null / undefined / boolean（条件渲染产物）。
    */
+  const SEPARATOR = '.'
+  const SUBSEPARATOR = ':'
+
+  function escapeUserKey(k) {
+    // 用户提供的 key 可能含特殊字符，转义防止冲突（与 React 同思路）
+    return ('' + k).replace(/[=:]/g, m => m === '=' ? '=0' : '=2')
+  }
+
+  function getElementKeyForFlatten(element, index) {
+    if (isValidElement(element) && element.key != null) return SEPARATOR + escapeUserKey(element.key)
+    return index.toString(36)
+  }
+
+  function flattenChildren(children, prefix = '', result = []) {
+    const list = Array.isArray(children) ? children : [children]
+    list.forEach((child, i) => {
+      if (child == null || typeof child === 'boolean') return
+      // 嵌套数组：递归展开，前缀加 SUBSEPARATOR
+      if (Array.isArray(child)) {
+        const nextPrefix = prefix === '' ? SEPARATOR : prefix + SUBSEPARATOR
+        flattenChildren(child, nextPrefix + i.toString(36) + SUBSEPARATOR, result)
+        return
+      }
+      // 字符串/数字 → TEXT_ELEMENT，便于一致处理
+      if (typeof child === 'string' || typeof child === 'number') {
+        const key = prefix === '' ? '.' + i.toString(36) : prefix + i.toString(36)
+        result.push({ ...createTextElement(child), key })
+        return
+      }
+      if (isValidElement(child)) {
+        const childKey = getElementKeyForFlatten(child, i)
+        const finalKey = prefix === '' ? childKey : prefix + childKey.slice(1)  // 去掉子级的开头 .
+        result.push({ ...child, key: finalKey })
+        return
+      }
+      // 其它类型（自定义可迭代等）当前保留原样，与 React 简化一致
+      result.push(child)
+    })
+    return result
+  }
+
   const Children = {
-    toArray(children) {
-      const flat = [children].flat(Infinity).filter(
-        c => c !== null && c !== undefined && typeof c !== 'boolean'
-      )
-      // 为缺失 key 的元素分配位置 key（不修改原对象）
-      return flat.map((c, i) => {
-        if (!isValidElement(c)) return c
-        if (c.props?.key != null) return c
-        return { ...c, props: { ...c.props, key: `.${i}` } }
+    toArray(children) { return flattenChildren(children) },
+    map(children, fn) {
+      // map 的结果再次当作 children 时，每项 key 自动包含位置前缀，
+      // 即便用户的回调返回了带 key 的元素也能保持唯一性
+      return flattenChildren(children).map((c, i) => {
+        const mapped = fn(c, i)
+        if (!isValidElement(mapped)) return mapped
+        const baseKey = mapped.key != null
+          ? '/' + escapeUserKey(mapped.key)
+          : ''
+        return { ...mapped, key: (c.key ?? i) + baseKey }
       })
     },
-    map(children, fn)     { return Children.toArray(children).map(fn) },
-    forEach(children, fn) { Children.toArray(children).forEach(fn) },
-    count(children)       { return Children.toArray(children).length },
+    forEach(children, fn) { flattenChildren(children).forEach(fn) },
+    count(children)       { return flattenChildren(children).length },
     only(children) {
-      const arr = Children.toArray(children)
+      const arr = flattenChildren(children)
       if (arr.length !== 1) throw new Error('Children.only: expected exactly one child')
       return arr[0]
     },
@@ -1897,7 +2199,14 @@
     },
   }
 
-  /** 在渲染前校验 props（updateFunctionComponent / updateClassComponent 调用） */
+  /**
+   * 在渲染前校验 props（updateFunctionComponent / updateClassComponent 调用）。
+   *
+   * 与 React 行为对齐：每条 (Component, propName, errorMessage) 警告在整个
+   * 应用生命周期内只输出一次。这避免了无效 props 导致的控制台刷屏，
+   * 也是真实 prop-types 包的默认策略（loggedTypeFailures 缓存）。
+   */
+  const _loggedPropTypeWarnings = new Set()
   function validateProps(component, props) {
     if (!component.propTypes) return
     const name = component.displayName || component.name || 'Component'
@@ -1906,7 +2215,14 @@
       if (typeof checker !== 'function') continue
       try {
         const err = checker(props, key, name)
-        if (err) console.warn(err.message)
+        if (err) {
+          // 去重 key：组件名 + 属性名 + 完整错误消息（同一错误内容不重复打印）
+          const dedupeKey = name + '::' + key + '::' + err.message
+          if (!_loggedPropTypeWarnings.has(dedupeKey)) {
+            _loggedPropTypeWarnings.add(dedupeKey)
+            console.warn(err.message)
+          }
+        }
       } catch (e) {
         console.warn('[PropTypes] 校验抛出异常：', e)
       }
@@ -2461,9 +2777,11 @@
     if (typeof type === 'function' && !type._isClass) {
       const original = setupSsrHooks()
       try {
+        // SSR 不绑定 ref（无真实 DOM），forwardRef 第二参数传 element.ref（可能为 null）
+        const ssrRef = element.ref ?? null
         let child
         if (type._isMemo)         child = type._type(props)
-        else if (type._isForwardRef) child = type._renderFn(props, props.ref ?? null)
+        else if (type._isForwardRef) child = type._renderFn(props, ssrRef)
         else                      child = type(props)
         return renderElement(child, isStatic)
       } catch (e) {
