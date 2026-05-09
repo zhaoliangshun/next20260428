@@ -77,6 +77,16 @@
     return { $$typeof: REACT_ELEMENT_TYPE, type, key, ref, props }
   }
 
+  /**
+   * createTextElement —— 把字符串/数字包装成 TEXT_ELEMENT 类型的 React Element。
+   *
+   * 这是 createElement 的内部辅助函数，用于统一处理文本节点：
+   *   - 字符串和数字会被包装成 { type: 'TEXT_ELEMENT', props: { nodeValue: text } }
+   *   - 这样 reconciler 可以用同一套逻辑处理文本节点和元素节点
+   *
+   * @param {string|number} text - 要包装的文本内容
+   * @returns {Object} TEXT_ELEMENT 类型的 React Element
+   */
   function createTextElement(text) {
     return {
       $$typeof: REACT_ELEMENT_TYPE,
@@ -175,9 +185,13 @@
   let deletions            = []     // 本轮需要从 DOM 中删除的 Fiber 列表
   let pendingRerender      = false  // commit 期间收到的 setState：等 commit 结束后再触发一轮
   let isCommitting         = false  // mutation pass 期间为 true，用于检测重入
+
   let workLoopScheduled    = false  // workLoop 是否已通过 requestIdle 排队（避免重复调度）
+
   let pendingPassiveRoots  = []     // 等待执行 useEffect 的根 Fiber 列表
+
   let passiveFlushScheduled = false // setTimeout 是否已派发 passive 刷新
+  
   let needsRerenderAfterCommit = false  // Suspense 首次挂起后触发回显 fallback
   // 渲染期捕获的 Error Boundary 队列：[{boundary, error}, ...]
   // 修复：原版用单变量保存，同一轮 render 中多个独立 Boundary 同时崩溃时只保留最后一个，
@@ -245,18 +259,53 @@
     return null
   }
 
-  /** completeUnitOfWork —— 退出 Provider fiber 时恢复 context 旧值（栈式隔离）。 */
+  /**
+   * completeUnitOfWork —— Fiber 节点完成工作后的清理操作。
+   *
+   * 当前职责：
+   *   - 退出 Context.Provider fiber 时恢复 context 旧值（栈式隔离）
+   *   - 确保子树渲染期间对 context 的修改不会影响到兄弟子树
+   *
+   * 调用时机：performUnitOfWork 处理完当前 fiber 的所有子节点后，
+   * 在向上回溯到父节点之前调用。
+   *
+   * @param {Object} fiber - 完成工作的 Fiber 节点
+   */
   function completeUnitOfWork(fiber) {
     if (fiber._context) fiber._context._currentValue = fiber._prevCtxValue
   }
 
   /**
-   * updateFunctionComponent —— 渲染函数组件。
-   *   1. 设置 hooks 上下文（wipFiber / hookIndex）
-   *   2. memo bailout：props 未变 + 无排队 state → 复用上次结果
-   *   3. Context.Provider 作用域：进入时注入值，退出时（completeUnitOfWork）恢复
-   *   4. forwardRef：把 fiber.ref（element 顶层 ref）以第二参数传给渲染函数
-   *   5. Suspense 集成：catch 子组件抛出的 Promise，标记 boundary
+   * 渲染函数组件。
+   *
+   * 执行步骤：
+   *   1. 初始化 hooks 上下文（wipFiber / hookIndex）
+   *   2. 合并 defaultProps 到 fiber.props
+   *   3. memo bailout：props 未变且无排队 state 时复用上次结果
+   *   4. PropTypes 校验（仅警告，不阻断渲染）
+   *   5. Context.Provider：注入新值，退出时（completeUnitOfWork）恢复旧值
+   *   6. 调用渲染函数（forwardRef 时透传 fiber.ref）
+   *   7. Suspense：捕获 Promise 并注册所有挂起的 Promise 到 boundary._pendingSet
+   *   8. Error Boundary：非 Promise 错误向上查找并分发
+   *
+   * @param {Object} fiber - 当前工作的 Fiber 节点
+   */
+  /**
+   * 更新函数组件
+   *
+   * 处理函数组件的渲染流程，包括：
+   * - 初始化 hook 状态
+   * - 应用 defaultProps
+   * - memo 组件的 bailout 优化
+   * - PropTypes 校验（开发期）
+   * - Context.Provider 值更新
+   * - 调用渲染函数获取子元素
+   * - 捕获 Suspense Promise 和 Error Boundary 错误
+   * - hook 顺序检测（开发期）
+   * - 协调子节点
+   *
+   * @param {Object} fiber - 当前处理的 fiber 节点
+   * @returns {void}
    */
   function updateFunctionComponent(fiber) {
     wipFiber  = fiber
@@ -350,11 +399,38 @@
   }
 
   /**
-   * checkHookOrder —— 对比 alternate 与当前 fiber 的 hook 标志序列。
+   * checkHookOrder —— 检测两次渲染之间 hook 调用顺序是否一致。
    *
+   * React 的硬规则：每次渲染必须按相同顺序调用相同数量的 hook。
+   * 若用户把 hook 放进 if/return-early 里，下次渲染就会乱序，
+   * 进而读到错误的 state 槽位。本检测对比新旧 hook 标志序列，发现不一致就警告。
+   *
+   * 检测逻辑：
+   *   1. 比较 hook 数量：数量变化说明在条件/循环中调用了 hook
+   *   2. 逐位比较类型码：用 _hookTypeCode 提取类型标识，发现不一致就警告
+   *
+   * @param {Object} fiber - 当前正在更新的函数组件 fiber
+   */
+  /**
+   * _hookTypeCode —— 将 hook 对象映射为单字符类型码。
+   *
+   * 用于 checkHookOrder 检测 hook 调用顺序是否一致。
    * 标志规则：每个 hook 在 wipFiber.hooks 中以特殊布尔标志区分类型
    * （_isEffect / _isLayoutEffect / _isInsertionEffect / _isContext / queue 等）。
-   * 我们把它们提炼成一个 short type code 数组，逐位对比。
+   * 把它们提炼成一个 short type code 数组，逐位对比。
+   *
+   * 类型码对照表：
+   *   'E' = useEffect
+   *   'L' = useLayoutEffect
+   *   'I' = useInsertionEffect
+   *   'C' = useContext
+   *   'D' = useDebugValue
+   *   'S' = useState / useReducer (有 queue 字段)
+   *   'M' = useMemo / useRef / useCallback / useId (有 value + deps)
+   *   '?' = 未知类型
+   *
+   * @param {Object} h - hook 对象
+   * @returns {string} 单字符类型码
    */
   function _hookTypeCode(h) {
     if (!h) return '?'
@@ -367,11 +443,13 @@
     if ('value' in h && 'deps' in h) return 'M'  // useMemo / useRef / useCallback / useId
     return '?'
   }
+
   function checkHookOrder(fiber) {
     const prev = fiber.alternate?.hooks
     const curr = fiber.hooks
     if (!prev || !curr) return
-    // 仅在 hook 数量或类型序列变化时警告（条件 hook 的典型征兆）
+
+    // hook 数量变化：说明在条件/循环中调用了 hook
     if (prev.length !== curr.length) {
       console.warn(
         `[mini-react] 检测到 hook 数量在两次渲染之间变化（${prev.length} → ${curr.length}）。` +
@@ -379,6 +457,8 @@
       )
       return
     }
+
+    // 逐位对比 hook 类型序列
     for (let i = 0; i < curr.length; i++) {
       const a = _hookTypeCode(prev[i])
       const b = _hookTypeCode(curr[i])
@@ -404,6 +484,9 @@
    *
    * 修复：原版直接 `Array.isArray(child) ? child : [child]`，当 child 为 string
    * 或 number 时会传入 reconcileChildren，element.type 为 undefined 触发崩溃。
+   *
+   * @param {*} child - 组件 render 的返回值
+   * @returns {Array} 规范化的 element 数组
    */
   function normalizeRenderOutput(child) {
     if (child == null || typeof child === 'boolean') return []
@@ -425,8 +508,23 @@
 
   /**
    * updateClassComponent —— 渲染类组件。
-   * 首次渲染创建实例；后续复用并同步 props/state；调用 render()。
-   * getDerivedStateFromProps / shouldComponentUpdate 均在此处理。
+   *
+   * 执行流程：
+   *   1. 应用 defaultProps（与函数组件一致）
+   *   2. PropTypes 校验（开发期）
+   *   3. 处理 static contextType：读取 context 值注入实例
+   *   4. 创建或复用实例：
+   *      - 首次渲染：new Component(props, context)
+   *      - 更新：同步 alternate 实例的最新 state 和回调队列
+   *   5. 调用 getDerivedStateFromProps（静态方法，返回 partial state）
+   *   6. shouldComponentUpdate 优化：
+   *      - PureComponent 做浅比较，props/state 未变则跳过渲染
+   *      - 自定义 shouldComponentUpdate 返回 false 也跳过
+   *   7. 调用 render() 获取子元素
+   *   8. 捕获 render 错误，交给 Error Boundary 处理
+   *   9. 协调子节点
+   *
+   * @param {Object} fiber - 当前处理的类组件 fiber 节点
    */
   function updateClassComponent(fiber) {
     // ── defaultProps（与函数组件一致）────────────────────────
@@ -506,7 +604,19 @@
 
   /**
    * updateHostComponent —— 渲染原生 DOM 节点、Fragment 或 Portal。
-   * Portal：fiber.dom 指向目标容器，子节点自然插入其中。
+   *
+   * 处理三种 host 类型：
+   *   1. Fragment：不产生 DOM，直接协调 children
+   *   2. Portal：fiber.dom 指向目标容器，子节点插入到该容器而非父 DOM
+   *   3. 原生 DOM 元素：创建或复用 DOM 节点，协调 children
+   *
+   * Portal 实现原理：
+   *   - createPortal 返回 type=PORTAL 的特殊 element
+   *   - updateHostComponent 检测到 PORTAL 后把 fiber.dom 设为目标容器
+   *   - commitWork 中 PORTAL 自身不执行 appendChild（容器已在 DOM 树中）
+   *   - 子节点通过正常协调流程插入到 portal 容器
+   *
+   * @param {Object} fiber - 当前处理的 host 组件 fiber 节点
    */
   function updateHostComponent(fiber) {
     if (fiber.type === Fragment) {
@@ -705,24 +815,24 @@
   }
 
   /**
-   * commitWork —— Mutation pass 递归处理。
+   * commitWork —— Mutation pass 递归处理 DOM 变更。
    *
-   * Bug fix（v2）：while 循环补加 null 守卫，
-   * 避免从无 dom 的 Fiber 向上回溯时越过根节点崩溃。
+   * 核心职责：
+   *   - PLACEMENT：把新 DOM 节点插入父容器
+   *   - UPDATE：对比新旧 props，更新 DOM 属性
+   *   - DELETION：从 DOM 树中移除节点
+   *   - ref 绑定：host 元素绑到 DOM，类组件绑到 instance
    *
-   * Portal：容器已在真实 DOM 中，不执行 appendChild，只处理子节点。
-   */
-  /**
-   * commitWork —— 把 sibling 遍历改为 while 循环以避免大列表栈溢出。
+   * 遍历策略（Bug fix v3）：
+   *   原版 sibling 用 commitWork(fiber.sibling) 递归调用，
+   *   一个父节点下若有 N 个 sibling 就会在 JS 调用栈上压 N 帧，
+   *   当列表长度达到几千就会触发 "Maximum call stack size exceeded"。
+   *   修复：sibling 遍历改成迭代，仅 child 仍递归（child 深度 = 组件嵌套层级，
+   *   实际项目中通常不超过几十层，安全可控）。
    *
-   * Bug fix（v3）：原版 sibling 用 commitWork(fiber.sibling) 递归调用，
-   * 一个父节点下若有 N 个 sibling 就会在 JS 调用栈上压 N 帧，
-   * 当列表长度达到几千（如 useDeferredValue demo 里的 200 项 × 多次更新，
-   * 或 ProfilerDemo 中 count 反复 +50 累积到很大）就会触发
-   * "Maximum call stack size exceeded"。
+   * Portal 处理：容器已在真实 DOM 中，不执行 appendChild，只处理子节点。
    *
-   * 修复：sibling 遍历改成迭代，仅 child 仍递归（child 深度 = 组件嵌套层级，
-   * 实际项目中通常不超过几十层，安全可控）。
+   * @param {Object} fiber - 要提交变更的 Fiber 节点
    */
   function commitWork(fiber) {
     let node = fiber
@@ -764,7 +874,19 @@
 
   /**
    * normalizeHostChildren —— mutation pass 后按 Fiber 顺序修正 DOM 节点物理位置。
-   * 解决 keyed diff 复用 DOM 但不移动位置的问题（insertBefore 天然支持同父移动）。
+   *
+   * 问题背景：keyed diff 可能复用 DOM 但不移动位置（如 [A,B] → [B,A]），
+   * 仅靠 appendChild 会导致 DOM 顺序与 Fiber 顺序不一致。
+   *
+   * 解决方案：收集所有直接子 host DOM 节点，按 Fiber 顺序用 insertBefore
+   * 重新排列，确保 DOM 顺序与 Fiber 树一致。
+   *
+   * 算法：
+   *   1. 收集 parentFiber 下所有直接 host children（跳过组件 fiber）
+   *   2. 遍历 doms 数组，用 insertBefore 把每个 dom 移到 cursor 位置
+   *   3. cursor 从 firstChild 开始，每次匹配成功就前进到 nextSibling
+   *
+   * @param {Object} parentFiber - 父 Fiber 节点
    */
   function normalizeHostChildren(parentFiber) {
     if (!parentFiber?.dom) return
@@ -777,6 +899,17 @@
     })
   }
 
+  /**
+   * collectDirectHostChildren —— 收集 fiber 下所有直接的 host DOM 节点。
+   *
+   * "直接"的含义：跳过组件 fiber（无 dom 的 fiber），只收集最终产生 DOM 的节点。
+   * 用于 normalizeHostChildren 收集需要重新排序的 DOM 节点列表。
+   *
+   * 遍历策略：sibling 用迭代避免栈溢出，child 递归（组件嵌套深度通常可控）。
+   *
+   * @param {Object} fiber - 起始 Fiber 节点
+   * @param {Array} doms - 收集结果的数组（会就地修改）
+   */
   function collectDirectHostChildren(fiber, doms) {
     let node = fiber
     while (node) {
@@ -788,7 +921,16 @@
 
   /**
    * commitAllInsertionEffects —— useInsertionEffect 同步执行（DOM 插入前最早阶段）。
-   * 遍历顺序与 commitAllLayoutEffects 相同（深度优先，child → sibling）。
+   *
+   * 执行时机：DOM mutation 之后、layout effect 之前。
+   * 这是所有 effect 中最早的，专门用于 CSS-in-JS 库注入样式，
+   * 确保样式在首次绘制前就绪，避免无样式内容闪烁（FOUC）。
+   *
+   * 遍历顺序：深度优先，child → sibling（与 commitAllLayoutEffects 一致）。
+   *
+   * 注意：此阶段 DOM 已插入但浏览器尚未绘制，禁止读取 DOM 尺寸（会触发强制重排）。
+   *
+   * @param {Object} fiber - 要处理 effect 的 Fiber 子树
    */
   function commitAllInsertionEffects(fiber) {
     let node = fiber
@@ -881,7 +1023,18 @@
     }
   }
 
-  /** flushPassiveEffects —— useEffect 异步执行（绘制后）。 */
+  /**
+   * flushPassiveEffects —— useEffect 异步执行（浏览器绘制后）。
+   *
+   * 执行时机：setTimeout(0) 延迟，确保在浏览器绘制完成后执行。
+   * 这是所有 effect 中最晚的，不会阻塞首帧渲染。
+   *
+   * 用途：网络请求、订阅、日志埋点等不紧急的副作用。
+   *
+   * 清理：先执行上次保存的 cleanup，再执行新 callback，保存新 cleanup。
+   *
+   * @param {Object} fiber - 要处理 effect 的 Fiber 子树
+   */
   function flushPassiveEffects(fiber) {
     let node = fiber
     while (node) {
@@ -898,6 +1051,19 @@
     }
   }
 
+  /**
+   * commitDeletion —— 从 DOM 中删除 fiber 子树。
+   *
+   * 执行流程：
+   *   1. 先执行 runUnmountEffects：按 React 一致顺序清理资源
+   *      （子节点 cleanup → 父节点 cleanup → cWU → ref 解绑）
+   *   2. 移除 DOM 节点：
+   *      - Portal：子节点在 portal 容器内，从 fiber.dom（目标容器）移除
+   *      - 普通节点：从 parentDom 移除
+   *
+   * @param {Object} fiber - 要删除的 Fiber 节点
+   * @param {Node} parentDom - 父 DOM 容器（Portal 不使用）
+   */
   function commitDeletion(fiber, parentDom) {
     runUnmountEffects(fiber)
     if (fiber.type === PORTAL) {
@@ -947,6 +1113,17 @@
     }
   }
 
+  /**
+   * removeDomNodes —— 递归移除 fiber 子树对应的所有 DOM 节点。
+   *
+   * 遍历策略：找到有 dom 的 fiber 就移除，无 dom 的（组件 fiber）递归处理子节点。
+   * sibling 用迭代避免栈溢出。
+   *
+   * 安全检查：只移除 parentNode === parentDom 的节点，防止误删其他位置的节点。
+   *
+   * @param {Object} fiber - 要移除的 Fiber 子树根节点
+   * @param {Node} parentDom - 父 DOM 容器
+   */
   function removeDomNodes(fiber, parentDom) {
     if (!fiber) return
     if (fiber.dom) {
@@ -961,6 +1138,15 @@
   // § 7  DOM 工具函数
   // ─────────────────────────────────────────────────────────────
 
+  /**
+   * DOM 属性处理工具函数
+   *
+   * isEvent: 判断是否为事件属性（以 'on' 开头）
+   * isProp:  判断是否为普通属性（非 children/key/ref/事件）
+   * isNew:   创建比较函数，判断属性值是否变化
+   * isGone:  创建比较函数，判断属性是否被删除
+   * toEvt:   把 React 事件名（onClick）转为 DOM 事件名（click）
+   */
   const isEvent = k => k.startsWith('on')
   const isProp  = k => k !== 'children' && k !== 'key' && k !== 'ref' && !isEvent(k)
   const isNew   = (p, n) => k => p[k] !== n[k]
@@ -970,13 +1156,25 @@
   const toEvt   = name => { const n = name.slice(2).toLowerCase(); return eventAliases[n] || n }
 
   // 布尔属性：从 DOM 上"移除"它们时应当置为 false 而不是 ''（'' 会被 IDL 解释为不一致状态）
+  /**
+   * 布尔属性集合：从 DOM 上"移除"它们时应当置为 false 而不是 ''。
+   * '' 会被 IDL 解释为不一致状态（如 disabled='' 在某些浏览器中仍视为禁用）。
+   */
   const BOOLEAN_PROPS = new Set([
     'checked', 'disabled', 'readOnly', 'multiple', 'autoFocus',
     'hidden', 'selected', 'controls', 'loop', 'muted', 'autoPlay', 'open',
   ])
-  // 必须用 setAttribute 而不是 dom[k] 赋值的属性（DOM property 与 attribute 名不一致）
+
+  /**
+   * 必须用 setAttribute 而不是 dom[k] 赋值的属性。
+   * 这些属性的 DOM property 与 attribute 名不一致（如 htmlFor 对应 for）。
+   */
   const ATTR_ONLY_PROPS = new Set(['htmlFor', 'class', 'for', 'tabIndex'])
-  // htmlFor → for；className 单独处理
+
+  /**
+   * 属性名映射表：JS 属性名 → HTML attribute 名。
+   * 例如：htmlFor → for
+   */
   const ATTR_NAME_MAP = { htmlFor: 'for' }
 
   /**
@@ -1124,12 +1322,19 @@
   ])
 
   /**
-   * 设置单个 style 字段：与 React 行为一致——数字值自动追加 'px'，
-   * 在 CSS_UNITLESS 中的属性除外。
+   * setStyleProp —— 设置单个 CSS 样式属性。
+   *
+   * 与 React 行为一致：
+   *   - 数字值自动追加 'px'（在 CSS_UNITLESS 中的属性除外）
+   *   - null/undefined/false 会清空该属性
    *
    * 修复：原版用 Object.assign 直接拷贝，dom.style.width = 12（数字）在浏览器
    * 中通常被忽略（CSS 期望长度单位）。React 的解决方案是把数字翻译成
    * '12px'，本实现对齐。
+   *
+   * @param {HTMLElement} dom - 目标 DOM 元素
+   * @param {string} key - CSS 属性名（camelCase）
+   * @param {*} value - 属性值
    */
   function setStyleProp(dom, key, value) {
     if (value == null || value === false) {
@@ -1143,6 +1348,20 @@
     }
   }
 
+  /**
+   * updateStyle —— 对比新旧 style 对象，同步差异到 DOM。
+   *
+   * 处理三种 style 形态：
+   *   - 字符串：直接设置 cssText
+   *   - 对象：逐个属性对比，删除已不存在的，更新变化的
+   *   - null/undefined：清空所有样式
+   *
+   * 优化：用 Object.is 比较属性值，避免不必要的 style 重计算。
+   *
+   * @param {HTMLElement} dom - 目标 DOM 元素
+   * @param {string|Object} prev - 旧 style 值
+   * @param {string|Object} next - 新 style 值
+   */
   function updateStyle(dom, prev, next) {
     if (typeof prev === 'string' && typeof next !== 'string') dom.style.cssText = ''
     if (prev && typeof prev === 'object') {
@@ -1159,11 +1378,30 @@
     }
   }
 
+  /**
+   * setRef —— 统一处理 ref 赋值（函数 ref 和对象 ref）。
+   *
+   * @param {Function|Object} ref - ref 回调函数或 { current: ... } 对象
+   * @param {*} value - 要赋给 ref 的值（DOM 节点或组件实例，卸载时为 null）
+   */
   function setRef(ref, value) {
     if (!ref) return
     if (typeof ref === 'function') ref(value); else ref.current = value
   }
 
+  /**
+   * createDom —— 根据 fiber 创建对应的 DOM 节点。
+   *
+   * 处理两种类型：
+   *   - TEXT_ELEMENT：创建文本节点（初始为空，内容通过 nodeValue 更新）
+   *   - 普通元素：用 document.createElement 创建，然后应用初始 props
+   *
+   * 注意：创建后调用 updateDom 把 fiber.props 同步到 DOM，但不包括 children
+   *（children 通过协调流程单独处理）。
+   *
+   * @param {Object} fiber - Host 组件 fiber 节点
+   * @returns {Node} 创建的 DOM 节点
+   */
   function createDom(fiber) {
     const dom = fiber.type === 'TEXT_ELEMENT'
       ? document.createTextNode('')
@@ -1262,6 +1500,25 @@
    * action 可以是值或 (prev) => next 函数（函数式更新避免闭包旧值）。
    * 支持惰性初始化：useState(() => expensive())。
    */
+  /**
+   * useState —— 组件状态管理 Hook。
+   *
+   * 这是 useReducer 的语法糖，提供更简洁的 API：
+   *   const [state, setState] = useState(initialValue)
+   *   const [state, setState] = useState(() => computeInitial())  // 惰性初始化
+   *
+   * setState 支持两种调用方式：
+   *   setState(newValue)           // 直接设置新值
+   *   setState(prev => next)       // 函数式更新，基于上一状态计算新值
+   *
+   * 特性：
+   *   - 状态更新会触发重渲染
+   *   - 相同值（Object.is 比较）不会触发重渲染
+   *   - 在渲染期间调用 setState 会被推迟到 commit 后执行
+   *
+   * @param {*} initialState - 初始状态值或返回初始值的函数
+   * @returns {[*, Function]} [当前状态, 设置状态的函数]
+   */
   function useState(initialState) {
     return useReducer(
       (s, a) => typeof a === 'function' ? a(s) : a,
@@ -1331,7 +1588,18 @@
     wipFiber.hooks.push(hook); hookIndex++
   }
 
-  /** useMemo —— 缓存昂贵计算，deps 不变时返回旧值。factory 须为纯函数。 */
+  /**
+   * useMemo —— 缓存昂贵计算结果。
+   *
+   * 在 deps 未变化时直接返回缓存值，跳过 factory 执行。
+   * 用于优化性能：避免每次渲染都重新计算复杂值。
+   *
+   * 注意：factory 必须是纯函数，不应有副作用。
+   *
+   * @param {Function} factory - 返回计算值的工厂函数
+   * @param {Array} deps - 依赖数组，变化时重新计算
+   * @returns {*} 缓存或新计算的值
+   */
   function useMemo(factory, deps) {
     assertInRender('useMemo')
     const old  = wipFiber.alternate?.hooks?.[hookIndex]
@@ -1340,13 +1608,45 @@
     return hook.value
   }
 
-  /** useRef —— 持久可变容器（.current 变化不触发重渲染）。 */
+  /**
+   * useRef —— 创建持久可变引用容器。
+   *
+   * 返回 { current: initialValue } 对象，在组件生命周期内保持稳定引用。
+   * .current 的变更不会触发重渲染，适合保存：
+   *   - DOM 节点引用
+   *   - 定时器 ID
+   *   - 任意需要在多次渲染间保持的可变值
+   *
+   * @param {*} initialValue - 初始值
+   * @returns {{current: *}} ref 对象
+   */
   function useRef(initialValue) { return useMemo(() => ({ current: initialValue }), []) }
 
-  /** useCallback —— 缓存函数引用，等价于 useMemo(() => fn, deps)。 */
+  /**
+   * useCallback —— 缓存函数引用。
+   *
+   * 等价于 useMemo(() => fn, deps)，用于避免子组件不必要的重渲染
+   *（当函数作为 prop 传递给 memo 子组件时）。
+   *
+   * @param {Function} fn - 要缓存的函数
+   * @param {Array} deps - 依赖数组
+   * @returns {Function} 缓存或新的函数引用
+   */
   function useCallback(fn, deps) { return useMemo(() => fn, deps) }
 
-  /** useId —— 生成组件实例稳定的唯一 ID（':r0:'、':r1:' 格式）。 */
+  /**
+   * useId —— 生成组件实例稳定的唯一 ID。
+   *
+   * 返回格式：':r0:'、':r1:'、':r2:' ...
+   * 用于需要唯一 ID 的表单元素（如 label htmlFor + input id）。
+   *
+   * 特性：
+   *   - 同一组件实例每次渲染返回相同 ID
+   *   - 不同组件实例获得不同 ID
+   *   - SSR 和客户端生成的 ID 一致（ hydration 安全）
+   *
+   * @returns {string} 唯一 ID 字符串
+   */
   function useId() { return useMemo(() => `:r${idCounter++}:`, []) }
 
   /**
@@ -1374,7 +1674,14 @@
 
   /**
    * useDebugValue —— 在 DevTools 中显示自定义 hook 的标签（生产环境无操作）。
-   * formatter 可选：(value) => string（DevTools 展开时才调用）。
+   *
+   * 用于自定义 hook 库开发，帮助开发者调试时识别 hook 状态。
+   * formatter 可选：接收 value 返回格式化字符串（DevTools 展开时才调用）。
+   *
+   * 注意：此实现仅占位保持 hookIndex 连续，实际调试功能由 DevTools 实现。
+   *
+   * @param {*} _value - 要显示的值
+   * @param {Function} [_formatter] - 可选的格式化函数
    */
   function useDebugValue(_value, _formatter) {
     // 占位 hook，保持 hookIndex 连续；实际调试功能由 DevTools 实现
@@ -1478,21 +1785,27 @@
   // ─────────────────────────────────────────────────────────────
 
   /**
-   * createContext —— 跨层级数据通道。
+   * flushUntilStable —— 同步刷新直到没有待处理的工作。
    *
-   * 原理（渲染期栈恢复）：
-   *   Provider beginWork → 保存旧值 → 注入 fiber.props.value
-   *   Provider completeWork → 恢复旧值（completeUnitOfWork）
-   *   子树 DFS 渲染期间 _currentValue 始终是最近 Provider 的值。
+   * 循环执行 flushSyncWork 和 passive effects，直到：
+   *   - 没有 nextUnitOfWork 和 wipRoot（渲染完成）
+   *   - 没有 pendingPassiveRoots（effect 执行完成）
+   *   - 达到最大循环次数（防止死循环）
    *
-   * ⚠️ memo 可能阻止 context 消费者响应更新（无精确订阅）。
+   * 用于 act() 测试工具确保所有异步工作同步完成。
+   *
+   * 安全机制：最多 50 轮，防止 effect 中无限 setState 导致死循环。
    */
-  function createContext(defaultValue) {
-    function Provider({ children }) {
-      // value 注入由 updateFunctionComponent 中 renderFn._context 分支完成
-      if (children == null) return null
-      return Array.isArray(children) ? createElement(Fragment, null, ...children) : children
+  function flushUntilStable() {
+    let safety = 50
+    while (safety-- > 0) {
+      flushSyncWork()
+      passiveFlushScheduled = false
+      const roots = pendingPassiveRoots.splice(0)
+      if (!roots.length && !nextUnitOfWork && !wipRoot) break
+      roots.forEach(flushPassiveEffects)
     }
+  }
     Provider._context = null
     const ctx = {
       _currentValue: defaultValue,
@@ -1942,8 +2255,25 @@
     return next.some((d, i) => !Object.is(d, prev[i]))
   }
 
-  // key/ref 已迁到 element/fiber 顶层（v3）
+  /**
+   * getElementKey —— 获取 React Element 的 key。
+   *
+   * key 已迁移到 element 顶层（v3），与真实 React 一致。
+   * 返回 null 表示无 key（与 undefined 区分，便于 Map 查找）。
+   *
+   * @param {Object} el - React Element
+   * @returns {string|null} key 值或 null
+   */
   function getElementKey(el) { return el?.key ?? null }
+
+  /**
+   * getFiberKey —— 获取 Fiber 节点的 key。
+   *
+   * key 已迁移到 fiber 顶层（v3），与真实 React 一致。
+   *
+   * @param {Object} f - Fiber 节点
+   * @returns {string|null} key 值或 null
+   */
   function getFiberKey(f)    { return f?.key  ?? null }
 
   /**
@@ -2033,16 +2363,56 @@
   const SEPARATOR = '.'
   const SUBSEPARATOR = ':'
 
+  /**
+   * escapeUserKey —— 转义用户提供的 key 中的特殊字符。
+   *
+   * key 中可能包含 = 或 : 等特殊字符，这些字符在内部 key 路径中有特殊含义，
+   * 需要转义防止冲突。转义规则与 React 一致：
+   *   '=' → '=0'
+   *   ':' → '=2'
+   *
+   * @param {string} k - 用户提供的 key
+   * @returns {string} 转义后的 key
+   */
   function escapeUserKey(k) {
     // 用户提供的 key 可能含特殊字符，转义防止冲突（与 React 同思路）
     return ('' + k).replace(/[=:]/g, m => m === '=' ? '=0' : '=2')
   }
 
+  /**
+   * getElementKeyForFlatten —— 为 flattenChildren 获取 element 的 key。
+   *
+   * 如果 element 有合法 key，返回带 SEPARATOR 前缀的转义 key；
+   * 否则返回 index 的 36 进制字符串表示。
+   *
+   * @param {Object} element - React Element
+   * @param {number} index - 在数组中的位置索引
+   * @returns {string} 用于 flatten 的 key 字符串
+   */
   function getElementKeyForFlatten(element, index) {
     if (isValidElement(element) && element.key != null) return SEPARATOR + escapeUserKey(element.key)
     return index.toString(36)
   }
 
+  /**
+   * flattenChildren —— 递归展平嵌套 children 数组，为每个子元素分配稳定 key。
+   *
+   * 处理规则：
+   *   - null/undefined/boolean：过滤掉（条件渲染产物）
+   *   - 嵌套数组：递归展平，key 路径用 SUBSEPARATOR(:) 连接
+   *   - 字符串/数字：包装成 TEXT_ELEMENT，分配位置 key
+   *   - 合法 element：保留并分配组合 key（前缀 + 原有 key）
+   *
+   * key 生成策略（与 React Children 一致）：
+   *   - 顶层：'.' + index（36 进制）
+   *   - 嵌套：父前缀 + ':' + index + ':' + 子 key
+   *   - 用户 key：转义后拼接到路径
+   *
+   * @param {*} children - 要展平的 children（可能是任意类型）
+   * @param {string} prefix - 当前 key 路径前缀
+   * @param {Array} result - 收集结果的数组
+   * @returns {Array} 展平后的 element 数组
+   */
   function flattenChildren(children, prefix = '', result = []) {
     const list = Array.isArray(children) ? children : [children]
     list.forEach((child, i) => {
@@ -2071,8 +2441,32 @@
     return result
   }
 
+  /**
+   * Children —— 安全操作 children prop 的工具集（与 React.Children 行为对齐）。
+   *
+   * v3 关键改动：
+   *   - key 写到 element 顶层而非 props（与 React 一致）
+   *   - toArray 对嵌套数组使用前缀 '. '.<i>' / '. '.<i>:.<j>' 形式，
+   *     映射后再当作 children 时仍保持稳定 key（避免列表重新挂载）
+   *   - map 的回调返回值若是合法 element 且没有显式 key，
+   *     会在原 key 前加上当前位置前缀（实现 key 链路追踪）
+   *
+   * 过滤规则：剔除 null / undefined / boolean（条件渲染产物）。
+   */
   const Children = {
+    /**
+     * 把任意 children 形态展平为 element 数组。
+     * @param {*} children - 任意 children 值
+     * @returns {Array} 展平后的 element 数组
+     */
     toArray(children) { return flattenChildren(children) },
+
+    /**
+     * 遍历并映射 children，为结果分配稳定 key。
+     * @param {*} children - 要映射的 children
+     * @param {Function} fn - 映射函数 (child, index) => newChild
+     * @returns {Array} 映射后的 element 数组
+     */
     map(children, fn) {
       // map 的结果再次当作 children 时，每项 key 自动包含位置前缀，
       // 即便用户的回调返回了带 key 的元素也能保持唯一性
@@ -2085,8 +2479,27 @@
         return { ...mapped, key: (c.key ?? i) + baseKey }
       })
     },
+
+    /**
+     * 遍历 children。
+     * @param {*} children - 要遍历的 children
+     * @param {Function} fn - 遍历回调 (child, index) => void
+     */
     forEach(children, fn) { flattenChildren(children).forEach(fn) },
+
+    /**
+     * 计算 children 数量（过滤后）。
+     * @param {*} children - 要计数的 children
+     * @returns {number} 子元素数量
+     */
     count(children)       { return flattenChildren(children).length },
+
+    /**
+     * 确保 children 有且仅有一个元素，返回该元素。
+     * @param {*} children - 要检查的 children
+     * @returns {Object} 唯一的 child element
+     * @throws {Error} 如果 children 数量不为 1
+     */
     only(children) {
       const arr = flattenChildren(children)
       if (arr.length !== 1) throw new Error('Children.only: expected exactly one child')
@@ -2350,6 +2763,18 @@
    * 失败时在 console.warn 输出，与真实 prop-types 行为一致。
    * 仅在 updateFunctionComponent 渲染前校验（生产环境可整体禁用）。
    */
+  /**
+   * makeChecker —— 创建 PropTypes 校验器工厂。
+   *
+   * 生成的校验器函数签名：(props, propName, componentName) => Error|null
+   * 返回 Error 表示校验失败，返回 null 表示通过。
+   *
+   * 自动包装 isRequired：如果 prop 为 null/undefined，返回必填错误。
+   *
+   * @param {Function} check - 实际校验函数 (value, propName, componentName) => Error|null
+   * @param {string} typeName - 类型名称（用于调试）
+   * @returns {Function} 校验器函数（带 isRequired 属性）
+   */
   function makeChecker(check, typeName) {
     function checker(props, propName, componentName) {
       const value = props[propName]
@@ -2367,7 +2792,22 @@
     return checker
   }
 
+  /**
+   * PropTypes —— 类似 prop-types 包的轻量替代。
+   *
+   * 用法：
+   *   function MyComp({ name, age }) { ... }
+   *   MyComp.propTypes = {
+   *     name: PropTypes.string.isRequired,
+   *     age:  PropTypes.number,
+   *     tags: PropTypes.arrayOf(PropTypes.string),
+   *   }
+   *
+   * 失败时在 console.warn 输出，与真实 prop-types 行为一致。
+   * 仅在 updateFunctionComponent 渲染前校验（生产环境可整体禁用）。
+   */
   const PropTypes = {
+    // 基础类型校验器
     string:  makeChecker((v, k, c) => typeof v === 'string'   ? null : new Error(`[PropTypes] ${c}.${k} 应为 string，收到 ${typeof v}`),  'string'),
     number:  makeChecker((v, k, c) => typeof v === 'number'   ? null : new Error(`[PropTypes] ${c}.${k} 应为 number，收到 ${typeof v}`),  'number'),
     bool:    makeChecker((v, k, c) => typeof v === 'boolean'  ? null : new Error(`[PropTypes] ${c}.${k} 应为 boolean，收到 ${typeof v}`), 'bool'),
@@ -2375,15 +2815,24 @@
     object:  makeChecker((v, k, c) => typeof v === 'object'   ? null : new Error(`[PropTypes] ${c}.${k} 应为 object，收到 ${typeof v}`),  'object'),
     array:   makeChecker((v, k, c) => Array.isArray(v)        ? null : new Error(`[PropTypes] ${c}.${k} 应为 array`),                       'array'),
     node:    makeChecker(() => null, 'node'),  // 任何可渲染都通过
-    any:     makeChecker(() => null, 'any'),
+    any:     makeChecker(() => null, 'any'),   // 任意类型都通过
 
-    /** oneOf(['a','b'])：枚举值校验 */
+    /**
+     * oneOf(['a','b'])：枚举值校验
+     * @param {Array} values - 允许的枚举值数组
+     * @returns {Function} 校验器
+     */
     oneOf(values) {
       return makeChecker((v, k, c) => values.includes(v)
         ? null
         : new Error(`[PropTypes] ${c}.${k} 应为 ${values.join('|')} 之一，收到 ${v}`), 'oneOf')
     },
-    /** oneOfType([T1, T2])：联合类型 */
+
+    /**
+     * oneOfType([T1, T2])：联合类型校验
+     * @param {Array} types - 类型校验器数组
+     * @returns {Function} 校验器
+     */
     oneOfType(types) {
       return makeChecker((v, k, c) => {
         for (const t of types) {
@@ -2393,7 +2842,12 @@
         return new Error(`[PropTypes] ${c}.${k} 不匹配任意指定类型`)
       }, 'oneOfType')
     },
-    /** arrayOf(T)：数组元素类型 */
+
+    /**
+     * arrayOf(T)：数组元素类型校验
+     * @param {Function} type - 元素类型校验器
+     * @returns {Function} 校验器
+     */
     arrayOf(type) {
       return makeChecker((v, k, c) => {
         if (!Array.isArray(v)) return new Error(`[PropTypes] ${c}.${k} 应为 array`)
@@ -2404,7 +2858,12 @@
         return null
       }, 'arrayOf')
     },
-    /** shape({a: T1, b: T2})：对象字段类型 */
+
+    /**
+     * shape({a: T1, b: T2})：对象字段类型校验
+     * @param {Object} spec - 字段名到校验器的映射
+     * @returns {Function} 校验器
+     */
     shape(spec) {
       return makeChecker((v, k, c) => {
         if (typeof v !== 'object' || v == null) return new Error(`[PropTypes] ${c}.${k} 应为 object`)
@@ -2415,7 +2874,12 @@
         return null
       }, 'shape')
     },
-    /** instanceOf(Class)：实例校验 */
+
+    /**
+     * instanceOf(Class)：实例校验
+     * @param {Function} Cls - 构造函数/类
+     * @returns {Function} 校验器
+     */
     instanceOf(Cls) {
       return makeChecker((v, k, c) => v instanceof Cls
         ? null
@@ -2429,6 +2893,9 @@
    * 与 React 行为对齐：每条 (Component, propName, errorMessage) 警告在整个
    * 应用生命周期内只输出一次。这避免了无效 props 导致的控制台刷屏，
    * 也是真实 prop-types 包的默认策略（loggedTypeFailures 缓存）。
+   *
+   * @param {Function} component - 组件函数或类
+   * @param {Object} props - 要校验的 props 对象
    */
   const _loggedPropTypeWarnings = new Set()
   function validateProps(component, props) {
@@ -2460,8 +2927,16 @@
   /**
    * usePrevious —— 返回上一次渲染时的值（首次渲染返回 undefined）。
    *
-   * 实现：用 ref 保存值，每次 effect 后写入新值；下次渲染读到的是上次写入的旧值。
-   * 用途：动画、变化检测、diff props 等。
+   * 实现原理：用 ref 保存值，每次 effect 后写入新值；
+   * 下次渲染时读到的是上次写入的旧值（前一次的值）。
+   *
+   * 常见用途：
+   *   - 动画：比较前后值计算变化量
+   *   - 变化检测：检测某个值是否发生变化
+   *   - diff props/state：比较前后状态执行特定逻辑
+   *
+   * @param {*} value - 当前值
+   * @returns {*} 上一次渲染时的值
    */
   function usePrevious(value) {
     const ref = useRef(undefined)
@@ -2471,7 +2946,14 @@
 
   /**
    * useToggle —— 布尔状态切换语法糖。
-   * @returns [state, toggle, setTrue, setFalse]
+   *
+   * 提供比 useState(true/false) 更语义化的 API：
+   *   - toggle: 切换状态
+   *   - setTrue: 设为 true
+   *   - setFalse: 设为 false
+   *
+   * @param {boolean} [initial=false] - 初始值
+   * @returns {[boolean, Function, Function, Function]} [状态, 切换, 设真, 设假]
    */
   function useToggle(initial = false) {
     const [state, setState] = useState(initial)
@@ -2482,7 +2964,19 @@
   }
 
   /**
-   * useCounter —— 数字计数器，附带 inc/dec/reset/set。
+   * useCounter —— 数字计数器 Hook，附带常用操作。
+   *
+   * 提供比 useState(number) 更语义化的 API：
+   *   - inc(step): 增加指定步长（默认 1），受 max 限制
+   *   - dec(step): 减少指定步长（默认 1），受 min 限制
+   *   - reset(): 重置为初始值
+   *   - set(value): 设置指定值，自动限制在 [min, max] 范围内
+   *
+   * @param {number} [initial=0] - 初始值
+   * @param {Object} [options] - 配置选项
+   * @param {number} [options.min=-Infinity] - 最小值限制
+   * @param {number} [options.max=Infinity] - 最大值限制
+   * @returns {{count: number, inc: Function, dec: Function, reset: Function, set: Function}} 计数器对象
    */
   function useCounter(initial = 0, { min = -Infinity, max = Infinity } = {}) {
     const [count, setCount] = useState(initial)
@@ -2494,8 +2988,14 @@
   }
 
   /**
-   * useDebounce —— 防抖：value 变化后等待 delay 毫秒，期间无新变化才返回新值。
-   * 适合搜索框：输入停止后才发起请求。
+   * useDebounce —— 防抖 Hook。
+   *
+   * value 变化后等待 delay 毫秒，期间无新变化才返回新值。
+   * 适合搜索框场景：用户停止输入后才发起请求，减少请求次数。
+   *
+   * @param {*} value - 要防抖的值
+   * @param {number} [delay=300] - 防抖延迟（毫秒）
+   * @returns {*} 防抖后的值
    */
   function useDebounce(value, delay = 300) {
     const [debounced, setDebounced] = useState(value)
@@ -2507,7 +3007,14 @@
   }
 
   /**
-   * useThrottle —— 节流：value 在 delay 毫秒内最多更新一次。
+   * useThrottle —— 节流 Hook。
+   *
+   * value 在 delay 毫秒内最多更新一次。
+   * 适合高频事件场景：滚动、resize 等，控制更新频率避免性能问题。
+   *
+   * @param {*} value - 要节流的值
+   * @param {number} [delay=300] - 节流间隔（毫秒）
+   * @returns {*} 节流后的值
    */
   function useThrottle(value, delay = 300) {
     const [throttled, setThrottled] = useState(value)
@@ -2530,7 +3037,14 @@
 
   /**
    * useInterval —— 声明式 setInterval。
+   *
    * 关键设计：用 ref 保存最新 callback，避免依赖数组导致 interval 反复重建。
+   * 这样 callback 可以安全地引用外部变量（包括 state），而不需要把它们加入依赖数组。
+   *
+   * 暂停 interval：传入 null 作为 delay
+   *
+   * @param {Function} callback - 定时执行的回调函数
+   * @param {number|null} delay - 间隔毫秒数，null 表示暂停
    */
   function useInterval(callback, delay) {
     const cbRef = useRef(callback)
@@ -2544,6 +3058,14 @@
 
   /**
    * useTimeout —— 声明式 setTimeout。
+   *
+   * 关键设计：用 ref 保存最新 callback，避免依赖数组导致 timeout 反复重建。
+   * callback 可以安全地引用外部变量，不需要把它们加入依赖数组。
+   *
+   * 取消 timeout：传入 null 作为 delay
+   *
+   * @param {Function} callback - 延迟执行的回调函数
+   * @param {number|null} delay - 延迟毫秒数，null 表示取消
    */
   function useTimeout(callback, delay) {
     const cbRef = useRef(callback)
@@ -2557,7 +3079,15 @@
 
   /**
    * useEventListener —— 声明式绑定事件，自动 cleanup。
-   * @param target  EventTarget（默认 window）
+   *
+   * 简化原生 addEventListener 的使用，组件卸载时自动移除监听，防止内存泄漏。
+   *
+   * 关键设计：用 ref 保存最新 handler，避免依赖数组导致监听器反复重建。
+   * handler 可以安全地引用外部变量，不需要把它们加入依赖数组。
+   *
+   * @param {string} eventName - 事件名称（如 'click', 'resize'）
+   * @param {Function} handler - 事件处理函数
+   * @param {EventTarget} [target=window] - 绑定事件的目标对象
    */
   function useEventListener(eventName, handler, target = typeof window !== 'undefined' ? window : null) {
     const handlerRef = useRef(handler)
@@ -2572,7 +3102,16 @@
 
   /**
    * useOnClickOutside —— 检测点击 ref 元素之外的区域。
-   * 常见于关闭下拉菜单、模态框。
+   *
+   * 常见用途：
+   *   - 点击外部关闭下拉菜单
+   *   - 点击外部关闭模态框/对话框
+   *   - 点击外部收起日期选择器等浮层组件
+   *
+   * 监听事件：mousedown 和 touchstart（覆盖鼠标和触摸设备）
+   *
+   * @param {{current: Element}} ref - 要检测的元素 ref
+   * @param {Function} handler - 点击外部时的回调函数
    */
   function useOnClickOutside(ref, handler) {
     useEffect(() => {
@@ -2591,6 +3130,17 @@
 
   /**
    * useKeyPress —— 检测某个键是否被按下。
+   *
+   * 返回布尔值表示目标键当前是否处于按下状态。
+   * 监听 window 的 keydown/keyup 事件。
+   *
+   * 常见用途：
+   *   - 快捷键检测（如 Ctrl+S 保存）
+   *   - 游戏控制（方向键、空格键等）
+   *   - 表单提交（Enter 键）
+   *
+   * @param {string} targetKey - 要检测的键名（如 'Enter', 'Escape', 'a'）
+   * @returns {boolean} 键是否被按下
    */
   function useKeyPress(targetKey) {
     const [pressed, setPressed] = useState(false)
@@ -2608,7 +3158,16 @@
   }
 
   /**
-   * useHover —— 鼠标悬停检测（返回 [ref, isHovering]）。
+   * useHover —— 鼠标悬停检测。
+   *
+   * 返回 ref 和布尔值，表示鼠标是否悬停在 ref 指向的元素上。
+   * 自动绑定 mouseenter/mouseleave 事件，组件卸载时自动清理。
+   *
+   * 用法：
+   *   const [ref, isHovering] = useHover()
+   *   return <div ref={ref}>{isHovering ? '悬停中' : '未悬停'}</div>
+   *
+   * @returns {[{current: Element|null}, boolean]} [ref, 是否悬停]
    */
   function useHover() {
     const [hovering, setHovering] = useState(false)
@@ -2629,7 +3188,14 @@
   }
 
   /**
-   * useWindowSize —— 跟踪窗口尺寸。
+   * useWindowSize —— 跟踪浏览器窗口尺寸。
+   *
+   * 返回包含 width 和 height 的对象，窗口大小变化时自动更新。
+   * 组件卸载时自动移除 resize 监听器。
+   *
+   * SSR 安全：服务端渲染时返回 { width: 0, height: 0 }
+   *
+   * @returns {{width: number, height: number}} 窗口尺寸对象
    */
   function useWindowSize() {
     const [size, setSize] = useState(() => ({
@@ -2646,7 +3212,18 @@
 
   /**
    * useMediaQuery —— 媒体查询匹配（响应式）。
+   *
+   * 监听 CSS 媒体查询的变化，返回匹配状态。
+   * 常用于响应式布局：根据屏幕尺寸渲染不同 UI。
+   *
+   * 用法：
    *   const isMobile = useMediaQuery('(max-width: 640px)')
+   *   const isDark = useMediaQuery('(prefers-color-scheme: dark)')
+   *
+   * 兼容性处理：优先使用 addEventListener，不支持则回退到 addListener（旧 API）
+   *
+   * @param {string} query - CSS 媒体查询字符串
+   * @returns {boolean} 是否匹配该媒体查询
    */
   function useMediaQuery(query) {
     const [matches, setMatches] = useState(() =>
@@ -2679,10 +3256,18 @@
   /**
    * useLocalStorage —— 与 localStorage 双向同步的 useState。
    *
+   * 提供与 useState 类似的 API，但值会持久化到 localStorage：
+   *   const [value, setValue] = useLocalStorage('myKey', 'default')
+   *
    * 特性：
    *   - 初始值惰性读取（避免 SSR 时报错）
-   *   - 值变化时自动 JSON 序列化写入
+   *   - 值变化时自动 JSON 序列化写入 localStorage
    *   - 读取异常时回退到 defaultValue（损坏的存储不会让应用崩溃）
+   *   - 同一 key 在多个组件间共享状态（需手动同步或配合 storage 事件）
+   *
+   * @param {string} key - localStorage 键名
+   * @param {*} defaultValue - 默认值（当 localStorage 无值或解析失败时使用）
+   * @returns {[*, Function]} [当前值, 设置值的函数]
    */
   function useLocalStorage(key, defaultValue) {
     const [value, setValue] = useState(() => {
@@ -2704,8 +3289,21 @@
   }
 
   /**
-   * useFetch —— 简易数据请求 hook。
-   * @returns { data, error, loading, refetch }
+   * useFetch —— 简易数据请求 Hook。
+   *
+   * 封装 fetch API，提供声明式的数据获取：
+   *   const { data, error, loading, refetch } = useFetch('/api/user')
+   *
+   * 特性：
+   *   - 自动在组件卸载时取消请求（避免内存泄漏和状态更新警告）
+   *   - url 变化时自动重新请求
+   *   - 提供 refetch 函数手动刷新
+   *
+   * 注意：此实现默认解析 JSON 响应，如需处理其他格式请自行扩展。
+   *
+   * @param {string} url - 请求 URL
+   * @param {Object} [options] - fetch 选项
+   * @returns {{data: *, error: Error|null, loading: boolean, refetch: Function}} 请求状态对象
    */
   function useFetch(url, options) {
     const [state, setState] = useState({ data: null, error: null, loading: true })
@@ -2725,7 +3323,13 @@
   }
 
   /**
-   * useUpdateEffect —— 跳过首次渲染的 useEffect（仅在依赖更新时执行）。
+   * useUpdateEffect —— 跳过首次渲染的 useEffect。
+   *
+   * 行为与 useEffect 相同，但首次渲染时不执行，仅在依赖项更新时执行。
+   * 适合需要在 prop/state 变化时执行逻辑，但不需要在 mount 时执行的场景。
+   *
+   * @param {Function} callback - effect 回调函数
+   * @param {Array} deps - 依赖数组
    */
   function useUpdateEffect(callback, deps) {
     const isFirst = useRef(true)
@@ -2736,7 +3340,12 @@
   }
 
   /**
-   * useMountEffect —— 仅 mount 一次的 useEffect 语法糖。
+   * useMountEffect —— 仅 mount 时执行的 useEffect 语法糖。
+   *
+   * 等价于 useEffect(() => { ... }, [])，代码语义更清晰。
+   * 适合只需要在组件挂载时执行一次的初始化逻辑。
+   *
+   * @param {Function} callback - mount 时执行的回调函数
    */
   function useMountEffect(callback) {
     useEffect(() => callback(), [])
@@ -2744,6 +3353,15 @@
 
   /**
    * useUnmountEffect —— 仅卸载时执行 cleanup 的 useEffect 语法糖。
+   *
+   * 适合需要在组件卸载时执行清理操作的场景：
+   *   - 取消订阅
+   *   - 清除定时器
+   *   - 断开 WebSocket 连接
+   *
+   * 注意：callback 在每次渲染时更新，确保卸载时执行的是最新的 cleanup 逻辑。
+   *
+   * @param {Function} callback - 卸载时执行的回调函数
    */
   function useUnmountEffect(callback) {
     const cbRef = useRef(callback)
@@ -2753,7 +3371,15 @@
 
   /**
    * useIsMounted —— 返回一个永远准确指示组件是否挂载的 ref。
+   *
+   * 返回的 ref.current：
+   *   - 组件挂载后为 true
+   *   - 组件卸载后为 false
+   *
    * 适合避免在异步回调中对已卸载组件 setState（虽然 React 18+ 已不警告）。
+   * 也可用于条件渲染判断。
+   *
+   * @returns {{current: boolean}} 挂载状态 ref
    */
   function useIsMounted() {
     const ref = useRef(false)
@@ -2766,7 +3392,14 @@
 
   /**
    * useForceUpdate —— 返回一个强制重渲染的函数。
-   * 极少使用，但偶尔在与命令式库集成时有用。
+   *
+   * 极少使用，但偶尔在与命令式库集成时有用：
+   *   - 外部状态变化需要强制刷新 UI
+   *   - 绕过 React 的默认优化机制
+   *
+   * 实现原理：使用 useReducer 的 dispatch 触发重渲染。
+   *
+   * @returns {Function} 强制重渲染函数
    */
   function useForceUpdate() {
     const [, force] = useReducer(s => s + 1, 0)
@@ -2774,7 +3407,15 @@
   }
 
   /**
-   * useCopyToClipboard —— 复制到剪贴板，返回 [copiedValue, copy]。
+   * useCopyToClipboard —— 复制到剪贴板。
+   *
+   * 返回 [copiedValue, copy]：
+   *   - copiedValue: 上次成功复制的文本（null 表示尚未复制或复制失败）
+   *   - copy(text): 异步复制函数，返回 Promise<boolean> 表示是否成功
+   *
+   * 使用 Clipboard API，需要用户交互触发（如点击事件）。
+   *
+   * @returns {[string|null, Function]} [上次复制的值, 复制函数]
    */
   function useCopyToClipboard() {
     const [copied, setCopied] = useState(null)
@@ -2807,6 +3448,11 @@
    *   const state = useSyncExternalStore(store.subscribe, store.getState)
    *
    * 支持中间件：createStore(reducer, init, [logger, thunk])
+   *
+   * @param {Function} reducer - (state, action) => newState 纯函数
+   * @param {*} initialState - 初始状态
+   * @param {Array} [middlewares=[]] - 中间件数组
+   * @returns {{getState: Function, dispatch: Function, subscribe: Function}} store 对象
    */
   function createStore(reducer, initialState, middlewares = []) {
     let state = initialState
@@ -2839,13 +3485,31 @@
 
   /**
    * thunkMiddleware —— 让 dispatch 接收函数（用于异步 action）。
-   *   store.dispatch(dispatch => fetch(...).then(d => dispatch({type:'SET', d})))
+   *
+   * 用法：
+   *   store.dispatch(dispatch => {
+   *     fetch('/api/data')
+   *       .then(r => r.json())
+   *       .then(data => dispatch({ type: 'SET_DATA', data }))
+   *   })
+   *
+   * @param {Object} store - { getState, dispatch }
+   * @returns {Function} 中间件函数
    */
   const thunkMiddleware = ({ getState, dispatch }) => next => action =>
     typeof action === 'function' ? action(dispatch, getState) : next(action)
 
   /**
    * loggerMiddleware —— 在 console 打印 action 流（调试用）。
+   *
+   * 输出格式：
+   *   action TYPE
+   *     prev: { ... }
+   *     action: { type, ... }
+   *     next: { ... }
+   *
+   * @param {Object} store - { getState }
+   * @returns {Function} 中间件函数
    */
   const loggerMiddleware = ({ getState }) => next => action => {
     console.groupCollapsed(`%c action %c${action.type ?? '(thunk)'}`, 'color:#888', 'color:#a78bfa')
@@ -2859,6 +3523,18 @@
 
   /**
    * combineReducers —— 把多个子 reducer 组合成一个根 reducer（每个管理 state 的一个分片）。
+   *
+   * 用法：
+   *   const rootReducer = combineReducers({
+   *     user: userReducer,
+   *     posts: postsReducer,
+   *   })
+   *   // state 结构: { user: {...}, posts: {...} }
+   *
+   * 优化：如果所有子 reducer 都返回原 state，根 reducer 也返回原 state（保持引用相等）。
+   *
+   * @param {Object} spec - 键名到 reducer 的映射对象
+   * @returns {Function} 组合后的根 reducer
    */
   function combineReducers(spec) {
     return (state = {}, action) => {
@@ -2887,7 +3563,17 @@
   ])
 
   /**
-   * 把字符串中的 HTML 特殊字符转义，避免 XSS。
+   * escapeHtml —— 把字符串中的 HTML 特殊字符转义，避免 XSS。
+   *
+   * 转义规则：
+   *   & → &amp;
+   *   < → &lt;
+   *   > → &gt;
+   *   " → &quot;
+   *   ' → &#39;
+   *
+   * @param {string} str - 要转义的字符串
+   * @returns {string} 转义后的字符串
    */
   function escapeHtml(str) {
     return String(str)
@@ -2899,8 +3585,15 @@
   }
 
   /**
-   * 把 JS 风格 style 对象（或字符串）序列化成 CSS 字符串。
-   * camelCase → kebab-case；忽略 null/undefined。
+   * styleToString —— 把 JS 风格 style 对象（或字符串）序列化成 CSS 字符串。
+   *
+   * 转换规则：
+   *   - camelCase → kebab-case
+   *   - 数值自动追加 'px'（UNITLESS_PROPS 中的属性除外）
+   *   - null/undefined/false 被忽略
+   *
+   * @param {string|Object} style - style 字符串或对象
+   * @returns {string} CSS 样式字符串
    */
   function styleToString(style) {
     if (style == null) return ''
@@ -2920,7 +3613,22 @@
 
   /**
    * propsToAttrs —— 把 props 序列化成 HTML 属性串（' key="value" key2="value2"'）。
-   * 跳过：children/key/ref/事件处理器/dangerouslySetInnerHTML
+   *
+   * 跳过的属性：
+   *   - children: 子元素单独处理
+   *   - key: React 内部使用，不输出到 HTML
+   *   - ref: React 内部使用，不输出到 HTML
+   *   - 事件处理器（on*）: 服务端不绑定事件
+   *   - dangerouslySetInnerHTML: 单独处理 __html
+   *
+   * 特殊处理：
+   *   - className → class
+   *   - htmlFor → for
+   *   - style: 调用 styleToString 序列化
+   *   - 布尔属性：值为 true 时只输出属性名
+   *
+   * @param {Object} props - 组件 props
+   * @returns {string} HTML 属性字符串（带前导空格）
    */
   function propsToAttrs(props) {
     const out = []
@@ -2940,7 +3648,7 @@
   }
 
   /**
-   * renderToString —— 把 element 树渲染成 HTML 字符串（不带 React 标记）。
+   * renderToString —— 把 element 树渲染成 HTML 字符串（带 React 标记）。
    *
    * 实现策略：递归遍历，函数组件直接调用拿到子元素；类组件创建实例后调用 render。
    * 不支持的 hook（依赖 fiber 的 useEffect 等）会以 no-op 形式跳过。
@@ -2949,22 +3657,44 @@
    *   - 不支持 Suspense（lazy 抛出 Promise 时直接返回 fallback）
    *   - 不执行任何副作用（useEffect / useLayoutEffect / componentDidMount）
    *   - useState 总是返回初始值（无法响应 setState）
+   *
+   * @param {Object} element - React Element 树
+   * @returns {string} HTML 字符串
    */
   function renderToString(element) {
     return renderElement(element, /*static*/ false)
   }
 
   /**
-   * renderToStaticMarkup —— 与 renderToString 相同，但不附加任何 React 标记。
-   * 适合纯静态页面生成（不会被 hydrateRoot 接管）。
+   * renderToStaticMarkup —— 把 element 树渲染成 HTML 字符串（不带 React 标记）。
+   *
+   * 与 renderToString 的区别：
+   *   - renderToString 保留 React 内部标记（如 data-reactroot），可被 hydrateRoot 接管
+   *   - renderToStaticMarkup 纯静态输出，适合邮件、PDF 生成等不需要交互的场景
+   *
+   * @param {Object} element - React Element 树
+   * @returns {string} HTML 字符串
    */
   function renderToStaticMarkup(element) {
     return renderElement(element, /*static*/ true)
   }
 
-  /** SSR 渲染上下文：模拟最少必要的 hooks 状态 */
+  /**
+   * SSR 渲染上下文：模拟最少必要的 hooks 状态。
+   *
+   * 在服务端渲染时临时替换全局 wipFiber/hookIndex，
+   * 让 useState/useReducer 等 hooks 能正常工作（返回初始值）。
+   */
   const ssrContext = { hooks: [], hookIndex: 0, isSSR: false }
 
+  /**
+   * setupSsrHooks —— 设置 SSR 模式的 hooks 上下文。
+   *
+   * 保存当前的 wipFiber/hookIndex，创建临时的 SSR 上下文。
+   * 返回原始值供 restoreSsrHooks 恢复。
+   *
+   * @returns {{wipFiber: Object|null, hookIndex: number}} 原始 hooks 上下文
+   */
   function setupSsrHooks() {
     const original = { wipFiber, hookIndex }
     ssrContext.hooks = []
@@ -2974,12 +3704,35 @@
     hookIndex = 0
     return original
   }
+  /**
+   * restoreSsrHooks —— 恢复 SSR 前的 hooks 上下文。
+   *
+   * @param {{wipFiber: Object|null, hookIndex: number}} original - setupSsrHooks 返回的原始值
+   */
   function restoreSsrHooks(original) {
     ssrContext.isSSR = false
     wipFiber  = original.wipFiber
     hookIndex = original.hookIndex
   }
 
+  /**
+   * renderElement —— 递归渲染 element 为 HTML 字符串。
+   *
+   * 处理各种类型的 element：
+   *   - null/undefined/boolean: 返回空字符串
+   *   - string/number: 转义后返回
+   *   - 数组: 递归渲染每个元素并连接
+   *   - TEXT_ELEMENT: 转义 nodeValue
+   *   - Fragment: 只渲染 children
+   *   - Portal: SSR 中无法生效，返回空
+   *   - 函数组件: 调用函数获取子元素（支持 memo/forwardRef）
+   *   - 类组件: 创建实例并调用 render
+   *   - 原生 DOM: 生成标签字符串
+   *
+   * @param {*} element - 要渲染的元素
+   * @param {boolean} isStatic - 是否为静态标记（影响某些属性的输出）
+   * @returns {string} HTML 字符串
+   */
   function renderElement(element, isStatic) {
     if (element == null || element === false || element === true) return ''
     if (typeof element === 'string' || typeof element === 'number') return escapeHtml(String(element))
